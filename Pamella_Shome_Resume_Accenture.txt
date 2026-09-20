@@ -1,0 +1,45 @@
+PAMELLA SHOME
+Pune, India | +91-8918075806 | Pamellashome5@gmail.com | linkedin.com/in/pamella-shome-a31089238
+
+PROFESSIONAL SUMMARY
+B.Tech graduate with hands-on Python and Java development across AI/ML, computer vision, REST APIs, automation, and data processing. Strong foundation in Object Oriented Programming (OOP), Data Structures and Algorithms (DSA), SQL, Git, and Software Development Life Cycle (SDLC). Collaborative, customer-centric engineer seeking the AI/ML Computational Science Associate role to design, test, and maintain applications using Python and emerging AI.
+
+TECHNICAL SKILLS
+Programming and Core CS: Python, Java, C++, Kotlin, Object Oriented Programming (OOP), Data Structures and Algorithms (DSA), Software Development Life Cycle (SDLC)
+Backend, Data, and Tools: SQL, MySQL, DBMS, REST APIs, Flask, Git, GitHub, debugging, testing, technical documentation, Docker
+AI / ML and Analytics: Machine Learning, Deep Learning, Computer Vision, OpenCV, NLP, LLMs, Vision-Language Models (VLM), data analysis, data processing, reporting
+Platforms: Android Studio, Android Automotive OS, VS Code, MATLAB, PowerShell
+
+PROFESSIONAL EXPERIENCE
+
+EDAG Production Solutions India Pvt Ltd | Pune, India | Jun 2024 - Present
+Android Automotive Developer | See-Through Surround-View Application
+- Develop, test, and maintain Java middleware for an Android Automotive See-Through surround-view application that ingests live video from multiple vehicle-mounted cameras.
+- Optimize the middleware pipeline for real-time use: fisheye-to-spherical projection, multi-camera stitching and blending, seam feathering, and exposure matching for a stable driver surround view.
+- Implement REST-style HTTP streaming endpoints between camera capture, middleware, and the in-vehicle display; debug video, performance, and connectivity issues.
+- Follow SDLC, OOP, Git, coding standards, and code reviews; write technical documentation and collaborate with hardware, QA, and application teams.
+
+PROJECT EXPERIENCE
+
+Vision-Language Model (VLM) Service Integration | Ongoing
+Python | REST APIs | Containerized services | Computer Vision and NLP
+- Building a Python application that integrates a Vision-Language Model (VLM) service so camera and image inputs can be queried in natural language for scene understanding with the See-Through pipeline.
+- Connecting containerized client, middleware, and VLM components over REST APIs, including payloads, configuration, and service health checks.
+- Diagnosed connectivity failures (connection refused) using curl and lsof; isolated root cause across config, ports, and container networking and documented the fix.
+
+Python Automation - Multilingual Test-Case Translation Pipeline | Self-directed
+- Developed a Python automation script (openpyxl, python-dotenv) to process QA spreadsheets and translate German test cases to English; migrated the backend to the DeepL REST API while preserving markup, images, and placeholders.
+
+Rental Property Analytics Tool | Data Science Intern, Saanvi Innovations Pvt Ltd | 2023
+- Built a Python analytics tool using web-scraped Gurugram rental data (BeautifulSoup), data cleaning, and regression/boosting models for price prediction; delivered visualizations and client reports.
+
+Cervical Cancer Risk Prediction Model | Data Science Intern, Saanvi Innovations Pvt Ltd | 2023
+- Developed a Python machine learning pipeline (Random Forest, SVM, XGBoost, LightGBM, CatBoost voting ensemble) with Recursive Feature Elimination (RFE) to predict cervical cancer risk from patient history.
+
+EDUCATION
+Rustamji Institute of Technology, BSF Academy | Gwalior, MP | Nov 2020 - Jun 2024
+Bachelor of Technology (B.Tech), Automobile Engineering | CGPA: 8.3 / 10 | Rajiv Gandhi Proudyogiki Vishwavidyalaya, Bhopal
+
+CERTIFICATIONS AND ADDITIONAL
+- Python Programming Essentials (Cisco); Data Science and Data Analytics (Kanishka IT Solutions); ANSYS and SolidWorks
+- Gen-AI Hackathon by EY (Participant); E-BAJA ATV Vehicle Challenge (Team Member); Coordinated Google Developer Fest 2023. Competencies: analytical problem solving, communication, teamwork, eagerness to learn cloud and AI.
