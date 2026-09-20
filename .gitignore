@@ -1,3 +1,4 @@
+/.opencv/
 /build/
 *.class
 left.mp4
