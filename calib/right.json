@@ -1,0 +1,30 @@
+{
+  "role": "right",
+  "imageWidth": 960,
+  "imageHeight": 720,
+  "rms": 0.35,
+  "fx": 217.12084868115406,
+  "fy": 217.12084868115406,
+  "cx": 475.2,
+  "cy": 390.24,
+  "k1": 0.041,
+  "k2": -0.015,
+  "k3": 0.005,
+  "k4": -0.0015,
+  "hasIntrinsics": true,
+  "hasExtrinsics": false,
+  "yawDeg": 90.0,
+  "pitchDeg": -14.0,
+  "rollDeg": 0.0,
+  "rvec": [
+    0,
+    0,
+    0
+  ],
+  "tvec": [
+    0,
+    0,
+    0
+  ],
+  "_note": "DUMMY calibration from synthetic chessboards composited on video stills. Not a physical camera cal."
+}
