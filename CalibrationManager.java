@@ -515,6 +515,16 @@ public final class CalibrationManager {
             found = false;
         }
         if (!found) {
+            try {
+                found = Calib3d.findChessboardCornersSB(gray, pattern, corners);
+                if (!(found && corners.total() >= (long) (pattern.width * pattern.height))) {
+                    found = false;
+                }
+            } catch (Throwable ignored) {
+                found = false;
+            }
+        }
+        if (!found) {
             gray.release();
             corners.release();
             return null;
