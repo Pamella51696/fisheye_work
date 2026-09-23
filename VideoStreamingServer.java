@@ -101,6 +101,15 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             return;
         }
 
+        if (CalibrationManager.isAlignMountsArgs(args)) {
+            Path folder = Paths.get(".").toAbsolutePath().normalize();
+            int code = alignMountPoseFromSeams(folder);
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
         int port = DEFAULT_PORT;
         Integer parsedPort = CalibrationManager.parsePort(args);
         if (parsedPort != null) {
@@ -154,38 +163,26 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
      */
     static int exportStitchPreview(Path folder) {
         Mat[] frames = new Mat[CAM_ROLE.length];
-        SphericalPanel[] panels = new SphericalPanel[CAM_ROLE.length];
         for (int i = 0; i < CAM_ROLE.length; i++) {
-            Path still = findCalibStill(folder, CAM_ROLE[i]);
-            if (still == null) {
-                System.err.println("No still for " + CAM_ROLE[i]
-                        + " (add calib/" + CAM_ROLE[i] + "/preview.jpg)");
+            String source = loadPreviewFrame(folder, CAM_ROLE[i], frames, i);
+            if (source == null) {
                 for (Mat m : frames) {
-                    if (m != null) m.release();
+                    if (m != null) {
+                        m.release();
+                    }
                 }
                 return 2;
             }
-            Mat bgr = Imgcodecs.imread(still.toAbsolutePath().toString());
-            if (bgr == null || bgr.empty()) {
-                System.err.println("Could not read " + still);
-                for (Mat m : frames) {
-                    if (m != null) m.release();
-                }
-                return 2;
+            System.out.println("Preview source " + CAM_ROLE[i] + ": " + source);
+        }
+        Mat panorama = renderPanorama(frames, null, null);
+        for (Mat m : frames) {
+            if (m != null) {
+                m.release();
             }
-            frames[i] = bgr;
-            panels[i] = new SphericalPanel(i);
         }
-        Mat[] ready = new Mat[CAM_ROLE.length];
-        for (int i = 0; i < ready.length; i++) {
-            ready[i] = new Mat();
-            panels[i].project(frames[i], ready[i]);
-            frames[i].release();
-        }
-        int overlap = panelOverlapPx();
-        Mat panorama = featherStitch(ready, overlap);
-        for (Mat m : ready) {
-            m.release();
+        if (panorama == null) {
+            return 1;
         }
         Path out = folder.resolve("stitch_preview.jpg");
         boolean ok = Imgcodecs.imwrite(out.toAbsolutePath().toString(), panorama);
@@ -196,6 +193,209 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         }
         System.out.println("Wrote " + out.toAbsolutePath());
         return 0;
+    }
+
+    /**
+     * Tune camera pitch/roll so overlap regions between adjacent panels match
+     * the same scene (extrinsic / mount alignment). Requires intrinsics in calib JSON.
+     */
+    static int alignMountPoseFromSeams(Path folder) {
+        Path[] clips = discoverClips(folder);
+        if (clips == null) {
+            return 2;
+        }
+        Mat[] frames = new Mat[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            if (!readFirstFrame(clips[i], frames, i)) {
+                System.err.println("Could not read a frame from " + clips[i]);
+                for (Mat m : frames) {
+                    if (m != null) {
+                        m.release();
+                    }
+                }
+                return 2;
+            }
+        }
+
+        double[] pitch = new double[CAM_ROLE.length];
+        double[] roll = new double[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            CalibrationManager.CameraModel m = CalibrationManager.load(CAM_ROLE[i]);
+            double[] pose = CalibrationManager.mountDegreesForStitch(
+                    i, m, Double.NaN, Double.NaN);
+            pitch[i] = pose[1];
+            roll[i] = pose[2];
+        }
+
+        double before = seamMismatchScore(frames, pitch, roll);
+        System.out.printf(Locale.US, "Seam mismatch before align: %.2f%n", before);
+
+        for (int pass = 0; pass < 2; pass++) {
+            for (int cam = 0; cam < CAM_ROLE.length; cam++) {
+                double basePitch = pitch[cam];
+                double baseRoll = roll[cam];
+                double bestPitch = basePitch;
+                double bestRoll = baseRoll;
+                double best = seamMismatchScore(frames, pitch, roll);
+                for (double dp = -10.0; dp <= 10.0; dp += 0.5) {
+                    for (double dr = -3.0; dr <= 3.0; dr += 0.5) {
+                        pitch[cam] = basePitch + dp;
+                        roll[cam] = baseRoll + dr;
+                        double score = seamMismatchScore(frames, pitch, roll);
+                        if (score < best) {
+                            best = score;
+                            bestPitch = pitch[cam];
+                            bestRoll = roll[cam];
+                        }
+                    }
+                }
+                pitch[cam] = bestPitch;
+                roll[cam] = bestRoll;
+                System.out.printf(Locale.US,
+                        "  %s pass %d: pitch=%.2f roll=%.2f  seam=%.2f%n",
+                        CAM_ROLE[cam], pass + 1, pitch[cam], roll[cam], best);
+            }
+        }
+
+        double after = seamMismatchScore(frames, pitch, roll);
+        System.out.printf(Locale.US, "Seam mismatch after align: %.2f%n", after);
+
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            double yaw = CAM_YAW_DEG[i];
+            CalibrationManager.CameraModel m = CalibrationManager.load(CAM_ROLE[i]);
+            if (m != null && m.hasExtrinsics) {
+                yaw = m.yawDeg;
+            }
+            if (!CalibrationManager.saveMountPose(CAM_ROLE[i], yaw, pitch[i], roll[i])) {
+                for (Mat frame : frames) {
+                    if (frame != null) {
+                        frame.release();
+                    }
+                }
+                return 1;
+            }
+        }
+
+        for (Mat frame : frames) {
+            if (frame != null) {
+                frame.release();
+            }
+        }
+        System.out.println("Mount pose saved to calib/*.json (hasExtrinsics=true).");
+        System.out.println("Re-run: java VideoStreamingServer --stitch-preview");
+        return 0;
+    }
+
+    private static boolean readFirstFrame(Path clip, Mat[] frames, int index) {
+        Path decodable = ensureDecodable(clip);
+        VideoCapture cap = openVideo(decodable);
+        if (cap == null || !cap.isOpened()) {
+            return false;
+        }
+        Mat frame = new Mat();
+        boolean ok = readBgr(cap, frame) && !frame.empty();
+        cap.release();
+        if (!ok) {
+            frame.release();
+            return false;
+        }
+        frames[index] = frame;
+        return true;
+    }
+
+    private static String loadPreviewFrame(Path folder, String role, Mat[] frames, int index) {
+        Path clip = findClip(folder, role);
+        if (clip != null && readFirstFrame(ensureDecodable(clip), frames, index)) {
+            return clip.getFileName().toString() + " (first frame)";
+        }
+        Path still = findCalibStill(folder, role);
+        if (still == null) {
+            System.err.println("No preview for " + role
+                    + " (need " + role + "_1.mp4 or calib/" + role + "/ still)");
+            return null;
+        }
+        Mat bgr = Imgcodecs.imread(still.toAbsolutePath().toString());
+        if (bgr == null || bgr.empty()) {
+            System.err.println("Could not read " + still);
+            return null;
+        }
+        frames[index] = bgr;
+        return still.getFileName().toString();
+    }
+
+    static Mat renderPanorama(Mat[] frames, double[] pitchDeg, double[] rollDeg) {
+        if (frames == null || frames.length != CAM_ROLE.length) {
+            return null;
+        }
+        Mat[] ready = new Mat[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            if (frames[i] == null || frames[i].empty()) {
+                for (Mat m : ready) {
+                    if (m != null) {
+                        m.release();
+                    }
+                }
+                return null;
+            }
+            double p = pitchDeg != null ? pitchDeg[i] : Double.NaN;
+            double r = rollDeg != null ? rollDeg[i] : Double.NaN;
+            SphericalPanel panel = new SphericalPanel(i, p, r);
+            ready[i] = new Mat();
+            panel.project(frames[i], ready[i]);
+        }
+        int overlap = panelOverlapPx();
+        Mat panorama = featherStitch(ready, overlap);
+        for (Mat m : ready) {
+            m.release();
+        }
+        return panorama;
+    }
+
+    static double seamMismatchScore(Mat[] frames, double[] pitchDeg, double[] rollDeg) {
+        Mat[] ready = new Mat[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            SphericalPanel panel = new SphericalPanel(i, pitchDeg[i], rollDeg[i]);
+            ready[i] = new Mat();
+            panel.project(frames[i], ready[i]);
+        }
+        int overlap = panelOverlapPx();
+        double score = overlapMismatch(ready, overlap);
+        for (Mat m : ready) {
+            m.release();
+        }
+        return score;
+    }
+
+    private static double overlapMismatch(Mat[] panels, int overlap) {
+        double sum = 0;
+        int count = 0;
+        int h = PANEL_HEIGHT;
+        int w = PANEL_WIDTH;
+        for (int i = 0; i < panels.length - 1; i++) {
+            Mat left = panels[i];
+            Mat right = panels[i + 1];
+            if (left == null || right == null || left.empty() || right.empty()) {
+                continue;
+            }
+            int x0 = w - overlap;
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < overlap; x++) {
+                    double[] a = left.get(y, x0 + x);
+                    double[] b = right.get(y, x);
+                    if (a == null || b == null || a.length < 3 || b.length < 3) {
+                        continue;
+                    }
+                    double la = 0.114 * a[0] + 0.587 * a[1] + 0.299 * a[2];
+                    double lb = 0.114 * b[0] + 0.587 * b[1] + 0.299 * b[2];
+                    if (la < INVALID_LUMA || lb < INVALID_LUMA) {
+                        continue;
+                    }
+                    sum += Math.abs(la - lb);
+                    count++;
+                }
+            }
+        }
+        return count > 0 ? sum / count : 1e9;
     }
 
     private static Path findCalibStill(Path folder, String role) {
@@ -387,18 +587,23 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         private int cachedSrcW = -1;
         private int cachedSrcH = -1;
  
+        private final double mountYawDeg;
+        private final double mountPitchDeg;
+        private final double mountRollDeg;
+
         SphericalPanel(int index) {
+            this(index, Double.NaN, Double.NaN);
+        }
+
+        SphericalPanel(int index, double pitchOverride, double rollOverride) {
             this.index = index;
             this.calib = CalibrationManager.load(CAM_ROLE[index]);
-            double yaw = CAM_YAW_DEG[index];
-            double pitch = CAM_PITCH_DEG[index];
-            double roll = CAM_ROLL_DEG[index];
-            if (this.calib != null && this.calib.hasExtrinsics) {
-                yaw = this.calib.yawDeg;
-                pitch = this.calib.pitchDeg;
-                roll = this.calib.rollDeg;
-            }
-            this.R = cameraToVehicle(yaw, pitch, roll);
+            double[] pose = CalibrationManager.mountDegreesForStitch(
+                    index, this.calib, pitchOverride, rollOverride);
+            this.mountYawDeg = pose[0];
+            this.mountPitchDeg = pose[1];
+            this.mountRollDeg = pose[2];
+            this.R = cameraToVehicle(mountYawDeg, mountPitchDeg, mountRollDeg);
         }
  
         void project(Mat src, Mat dst) {
@@ -426,11 +631,7 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             double cx = K[2];
             double cy = K[3];
             double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
-            double panelYawDeg = CAM_YAW_DEG[index];
-            if (calib != null && calib.hasExtrinsics) {
-                panelYawDeg = calib.yawDeg;
-            }
-            double yaw0 = Math.toRadians(panelYawDeg);
+            double yaw0 = Math.toRadians(mountYawDeg);
             double yawSpan = Math.toRadians(PANEL_YAW_DEG);
             double pitchSpan = Math.toRadians(PANEL_PITCH_DEG);
             double horizonY = HORIZON_FRACTION * PANEL_HEIGHT;

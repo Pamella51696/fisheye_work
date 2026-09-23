@@ -123,6 +123,51 @@ public final class CalibrationManager {
             double sy = imageHeight > 0 ? (double) srcH / imageHeight : 1.0;
             return new double[] { fx * sx, fy * sy, cx * sx, cy * sy };
         }
+
+        CameraModel withMountPose(double yawDeg, double pitchDeg, double rollDeg,
+                                  boolean hasExtrinsics) {
+            return new CameraModel(role, imageWidth, imageHeight, rms,
+                    fx, fy, cx, cy, k1, k2, k3, k4,
+                    hasIntrinsics, hasExtrinsics,
+                    yawDeg, pitchDeg, rollDeg, rvec, tvec);
+        }
+    }
+
+    /**
+     * Yaw / pitch / roll (degrees) used when building the spherical remap.
+     * Intrinsics alone do not change mount angles; {@code hasExtrinsics} must be
+     * true (chessboard ground pose or {@code --align-mounts}) for saved pitch/roll.
+     */
+    static double[] mountDegreesForStitch(int camIndex, CameraModel calib,
+                                         double pitchOverride, double rollOverride) {
+        double yaw = VideoStreamingServer.CAM_YAW_DEG[camIndex];
+        double pitch = VideoStreamingServer.CAM_PITCH_DEG[camIndex];
+        double roll = VideoStreamingServer.CAM_ROLL_DEG[camIndex];
+        if (calib != null && calib.hasExtrinsics) {
+            yaw = calib.yawDeg;
+            pitch = calib.pitchDeg;
+            roll = calib.rollDeg;
+        }
+        if (!Double.isNaN(pitchOverride)) {
+            pitch = pitchOverride;
+        }
+        if (!Double.isNaN(rollOverride)) {
+            roll = rollOverride;
+        }
+        return new double[] { yaw, pitch, roll };
+    }
+
+    static boolean saveMountPose(String role, double yawDeg, double pitchDeg,
+                                 double rollDeg) {
+        CameraModel existing = load(role);
+        if (existing == null || !existing.hasIntrinsics) {
+            System.err.println("Cannot save mount pose for '" + role
+                    + "': run --calibrate first (intrinsics required).");
+            return false;
+        }
+        CameraModel updated = existing.withMountPose(
+                yawDeg, pitchDeg, rollDeg, true);
+        return save(updated);
     }
 
     static Path calibFile(String role) {
@@ -215,7 +260,7 @@ public final class CalibrationManager {
             collectFromNamedImages(opt.folder.resolve(CALIB_DIR), role, pattern,
                     objectTemplate, objectPoints, imagePoints, imageSize, opt.maxViews);
         }
-        if (imagePoints.size() < opt.maxViews) {
+        if (imagePoints.size() < opt.minViews) {
             collectFromVideos(role, camIndex, opt, pattern, objectTemplate,
                     objectPoints, imagePoints, imageSize);
         }
@@ -282,6 +327,9 @@ public final class CalibrationManager {
         } else {
             System.out.println("Extrinsics: keeping configured vehicle yaw/pitch/roll"
                     + " (chessboard pose was not stable enough).");
+            System.out.println("  Seam alignment still off? After --calibrate run:");
+            System.out.println("    java VideoStreamingServer --align-mounts");
+            System.out.println("  (uses your left/front/right/rear clips, no checkerboard).");
         }
         System.out.println("Generating remapping LUT at runtime from K + D.");
 
@@ -824,12 +872,11 @@ public final class CalibrationManager {
             double rollDeg = Math.toDegrees(Math.atan2(xy, xx));
             R.release();
             if (pitchDeg >= -62 && pitchDeg <= 8) {
-                // Weight flatter boards more heavily when estimating ground pitch.
                 double flatness = Math.min(1.0, Math.abs(oz));
-                if (flatness > 0.35) {
+                if (flatness > 0.15) {
                     pitches.add(pitchDeg);
                 }
-                if (Math.abs(rollDeg) <= 22 && flatness > 0.35) {
+                if (Math.abs(rollDeg) <= 22 && flatness > 0.15) {
                     rolls.add(rollDeg);
                 }
             }
@@ -842,19 +889,19 @@ public final class CalibrationManager {
             out.tvec = new double[] { getCoeff(tvec, 0), getCoeff(tvec, 1), getCoeff(tvec, 2) };
         }
 
-        if (pitches.size() < 3) {
+        if (pitches.isEmpty()) {
             return out;
         }
         double pitchMed = median(pitches);
         double configuredPitch = VideoStreamingServer.CAM_PITCH_DEG[camIndex];
         double pitchSpread = spread(pitches);
-        if (pitchSpread > 9.0) {
-            // Highly tilted boards — blend toward the mount prior.
-            pitchMed = 0.35 * pitchMed + 0.65 * configuredPitch;
+        if (pitchSpread > 9.0 || pitches.size() < 3) {
+            double w = pitches.size() < 3 ? 0.45 : 0.35;
+            pitchMed = w * pitchMed + (1.0 - w) * configuredPitch;
         }
         out.pitchDeg = pitchMed;
-        if (rolls.size() >= 3) {
-            out.rollDeg = median(rolls);
+        if (!rolls.isEmpty()) {
+            out.rollDeg = rolls.size() >= 3 ? median(rolls) : median(rolls);
         }
         out.hasExtrinsics = true;
         return out;
@@ -1144,6 +1191,18 @@ public final class CalibrationManager {
         return Double.parseDouble(s);
     }
 
+    static boolean isAlignMountsArgs(String[] args) {
+        if (args == null) {
+            return false;
+        }
+        for (String a : args) {
+            if ("--align-mounts".equals(a)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     static boolean isCalibrateArgs(String[] args) {
         if (args == null) return false;
         for (String a : args) {
@@ -1172,6 +1231,10 @@ public final class CalibrationManager {
             if (m == null || !m.hasIntrinsics) {
                 System.out.println("  calib " + role + ": FOV fallback ("
                         + VideoStreamingServer.INPUT_FISHEYE_FOV_DEG + " deg equidistant)");
+            } else if (!m.hasExtrinsics) {
+                System.out.printf(Locale.US,
+                        "  calib %s: intrinsics OK (rms=%.3f) but mount pose = defaults — run --align-mounts%n",
+                        role, m.rms);
             } else {
                 System.out.printf(Locale.US,
                         "  calib %s: K fx=%.1f fy=%.1f cx=%.1f cy=%.1f  D=[%.4f %.4f %.4f %.4f]  rms=%.3f%s%n",
