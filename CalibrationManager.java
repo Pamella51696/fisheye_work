@@ -394,6 +394,41 @@ public final class CalibrationManager {
         };
     }
 
+    /**
+     * Inverse of {@link #projectFisheye}: pixel → unit ray in the OpenCV camera frame.
+     */
+    static double[] unprojectFisheye(double u, double v, double[] k,
+                                     double k1, double k2, double k3, double k4) {
+        if (k == null || k.length < 4 || Math.abs(k[0]) < 1e-6 || Math.abs(k[1]) < 1e-6) {
+            return null;
+        }
+        double xd = (u - k[2]) / k[0];
+        double yd = (v - k[3]) / k[1];
+        double rd = Math.hypot(xd, yd);
+        double theta = rd;
+        for (int iter = 0; iter < 10; iter++) {
+            double t2 = theta * theta;
+            double t4 = t2 * t2;
+            double t6 = t4 * t2;
+            double t8 = t4 * t4;
+            double td = theta * (1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8);
+            double dt = 1.0 + 3.0 * k1 * t2 + 5.0 * k2 * t4 + 7.0 * k3 * t6 + 9.0 * k4 * t8;
+            if (Math.abs(dt) < 1e-9) {
+                break;
+            }
+            theta -= (td - rd) / dt;
+            if (theta < 0) {
+                theta = 0;
+            }
+            if (theta > Math.PI * 0.49) {
+                theta = Math.PI * 0.49;
+            }
+        }
+        double az = Math.atan2(yd, xd);
+        double st = Math.sin(theta);
+        return new double[] { st * Math.cos(az), st * Math.sin(az), Math.cos(theta) };
+    }
+
     private static void collectFromImageFolder(Path folder, Size pattern, Mat objectTemplate,
                                                List<Mat> objectPoints, List<Mat> imagePoints,
                                                int[] imageSize, int maxViews) {
