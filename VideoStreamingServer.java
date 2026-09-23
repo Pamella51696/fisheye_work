@@ -92,6 +92,15 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             return;
         }
 
+        if (isStitchPreviewArgs(args)) {
+            Path folder = Paths.get(".").toAbsolutePath().normalize();
+            int code = exportStitchPreview(folder);
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
         int port = DEFAULT_PORT;
         Integer parsedPort = CalibrationManager.parsePort(args);
         if (parsedPort != null) {
@@ -127,6 +136,95 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
      * Finds left/front/right/rear clips in {@code folder}. Prefers {@code name_1.mp4}
      * then {@code name.mp4}/{@code .mov}, then any file whose name contains the role.
      */
+    static boolean isStitchPreviewArgs(String[] args) {
+        if (args == null) {
+            return false;
+        }
+        for (String a : args) {
+            if ("--stitch-preview".equals(a)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Renders one offline panorama JPEG from a still per camera (for tuning calib).
+     * Looks for calib/&lt;role&gt;/preview.jpg, then dummy_00.jpg, then any image in the folder.
+     */
+    static int exportStitchPreview(Path folder) {
+        Mat[] frames = new Mat[CAM_ROLE.length];
+        SphericalPanel[] panels = new SphericalPanel[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            Path still = findCalibStill(folder, CAM_ROLE[i]);
+            if (still == null) {
+                System.err.println("No still for " + CAM_ROLE[i]
+                        + " (add calib/" + CAM_ROLE[i] + "/preview.jpg)");
+                for (Mat m : frames) {
+                    if (m != null) m.release();
+                }
+                return 2;
+            }
+            Mat bgr = Imgcodecs.imread(still.toAbsolutePath().toString());
+            if (bgr == null || bgr.empty()) {
+                System.err.println("Could not read " + still);
+                for (Mat m : frames) {
+                    if (m != null) m.release();
+                }
+                return 2;
+            }
+            frames[i] = bgr;
+            panels[i] = new SphericalPanel(i);
+        }
+        Mat[] ready = new Mat[CAM_ROLE.length];
+        for (int i = 0; i < ready.length; i++) {
+            ready[i] = new Mat();
+            panels[i].project(frames[i], ready[i]);
+            frames[i].release();
+        }
+        int overlap = panelOverlapPx();
+        Mat panorama = featherStitch(ready, overlap);
+        for (Mat m : ready) {
+            m.release();
+        }
+        Path out = folder.resolve("stitch_preview.jpg");
+        boolean ok = Imgcodecs.imwrite(out.toAbsolutePath().toString(), panorama);
+        panorama.release();
+        if (!ok) {
+            System.err.println("Could not write " + out);
+            return 1;
+        }
+        System.out.println("Wrote " + out.toAbsolutePath());
+        return 0;
+    }
+
+    private static Path findCalibStill(Path folder, String role) {
+        Path dir = folder.resolve(CalibrationManager.CALIB_DIR).resolve(role);
+        Path[] preferred = {
+            dir.resolve("preview.jpg"),
+            dir.resolve("dummy_00.jpg"),
+            dir.resolve("frame_00.jpg")
+        };
+        for (Path p : preferred) {
+            if (isUsableFile(p)) {
+                return p;
+            }
+        }
+        if (!Files.isDirectory(dir)) {
+            return null;
+        }
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
+            for (Path p : stream) {
+                String n = p.getFileName().toString().toLowerCase(Locale.ROOT);
+                if (n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png")) {
+                    return p;
+                }
+            }
+        } catch (IOException ignored) {
+        }
+        return null;
+    }
+
     static Path[] discoverClips(Path folder) {
         Path[] found = new Path[4];
         for (int i = 0; i < CAM_ROLE.length; i++) {
@@ -328,7 +426,11 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             double cx = K[2];
             double cy = K[3];
             double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
-            double yaw0 = Math.toRadians(CAM_YAW_DEG[index]);
+            double panelYawDeg = CAM_YAW_DEG[index];
+            if (calib != null && calib.hasExtrinsics) {
+                panelYawDeg = calib.yawDeg;
+            }
+            double yaw0 = Math.toRadians(panelYawDeg);
             double yawSpan = Math.toRadians(PANEL_YAW_DEG);
             double pitchSpan = Math.toRadians(PANEL_PITCH_DEG);
             double horizonY = HORIZON_FRACTION * PANEL_HEIGHT;

@@ -51,6 +51,11 @@ public final class CalibrationManager {
     static final int DEFAULT_MIN_VIEWS = 12;
     static final int DEFAULT_MAX_VIEWS = 40;
     static final int DEFAULT_FRAME_STEP = 5;
+    /** Reject chessboard detections smaller than this fraction of image diagonal. */
+    private static final double MIN_CORNER_SPAN_FRAC = 0.10;
+    /** Drop calibration views above this multiple of the median reprojection error. */
+    private static final double OUTLIER_RMS_FACTOR = 2.4;
+    private static final double OUTLIER_RMS_FLOOR_PX = 1.15;
 
     private CalibrationManager() {}
 
@@ -231,36 +236,22 @@ public final class CalibrationManager {
         System.out.println("Camera resolution: " + w + " × " + h);
         System.out.println("Calibrating...");
 
-        Mat K = Mat.eye(3, 3, CvType.CV_64F);
-        double fGuess = VideoStreamingServer.fisheyeFocal(w, h,
-                VideoStreamingServer.INPUT_FISHEYE_FOV_DEG);
-        K.put(0, 0, fGuess);
-        K.put(1, 1, fGuess);
-        K.put(0, 2, w * VideoStreamingServer.FISHEYE_CX);
-        K.put(1, 2, h * VideoStreamingServer.FISHEYE_CY);
-        Mat D = Mat.zeros(4, 1, CvType.CV_64F);
-        List<Mat> rvecs = new ArrayList<>();
-        List<Mat> tvecs = new ArrayList<>();
-
-        int flags = Calib3d.fisheye_CALIB_USE_INTRINSIC_GUESS
-                | Calib3d.fisheye_CALIB_RECOMPUTE_EXTRINSIC
-                | Calib3d.fisheye_CALIB_FIX_SKEW;
-        TermCriteria criteria = new TermCriteria(
-                TermCriteria.COUNT + TermCriteria.EPS, 200, 1e-8);
-
-        double rms;
-        try {
-            rms = Calib3d.fisheye_calibrate(
-                    objectPoints, imagePoints, new Size(w, h),
-                    K, D, rvecs, tvecs, flags, criteria);
-        } catch (CvException e) {
-            System.err.println("fisheye.calibrate failed: " + e.getMessage());
+        FisheyeCalibResult cal = runRefinedFisheyeCalibrate(
+                role, objectPoints, imagePoints, w, h, opt.minViews);
+        if (cal == null) {
             releaseAll(objectPoints);
             releaseAll(imagePoints);
             objectTemplate.release();
-            K.release();
-            D.release();
             return false;
+        }
+        Mat K = cal.K;
+        Mat D = cal.D;
+        List<Mat> rvecs = cal.rvecs;
+        List<Mat> tvecs = cal.tvecs;
+        double rms = cal.rms;
+        if (cal.droppedViews > 0) {
+            System.out.println("Refinement: kept " + imagePoints.size() + " views after dropping "
+                    + cal.droppedViews + " high-error outlier(s).");
         }
 
         double fx = K.get(0, 0)[0];
@@ -484,6 +475,15 @@ public final class CalibrationManager {
         Mat img64 = new Mat();
         corners.convertTo(img64, CvType.CV_64FC2);
         corners.release();
+
+        double diag = Math.hypot(imageSize[0], imageSize[1]);
+        double span = cornerSpan(img64);
+        if (span < MIN_CORNER_SPAN_FRAC * diag) {
+            System.err.println("Skipping " + label + ": board too small in frame ("
+                    + String.format(Locale.US, "%.0f", span) + " px span).");
+            img64.release();
+            return false;
+        }
         Mat obj = objectTemplate.clone();
         objectPoints.add(obj);
         imagePoints.add(img64);
@@ -492,47 +492,266 @@ public final class CalibrationManager {
     }
 
     static MatOfPoint2f detectChessboard(Mat bgr, Size pattern) {
+        Mat gray = toGray(bgr);
+        MatOfPoint2f corners = detectOnGray(gray, pattern);
+        if (corners == null) {
+            Mat claheGray = applyClahe(gray);
+            corners = detectOnGray(claheGray, pattern);
+            claheGray.release();
+        }
+        if (corners == null) {
+            gray.release();
+            return null;
+        }
+        refineCorners(gray, corners);
+        gray.release();
+        return corners;
+    }
+
+    private static Mat toGray(Mat bgr) {
         Mat gray = new Mat();
         if (bgr.channels() == 1) {
             bgr.copyTo(gray);
         } else {
             Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
         }
-        MatOfPoint2f corners = new MatOfPoint2f();
+        return gray;
+    }
+
+    private static Mat applyClahe(Mat gray) {
+        Mat out = new Mat();
+        try {
+            org.opencv.imgproc.CLAHE clahe = Imgproc.createCLAHE(2.5, new Size(8, 8));
+            clahe.apply(gray, out);
+        } catch (Throwable t) {
+            gray.copyTo(out);
+        }
+        return out;
+    }
+
+    private static MatOfPoint2f detectOnGray(Mat gray, Size pattern) {
         int[] flagSets = {
-            Calib3d.CALIB_CB_ADAPTIVE_THRESH
-                    + Calib3d.CALIB_CB_NORMALIZE_IMAGE,
-            Calib3d.CALIB_CB_ADAPTIVE_THRESH
-                    + Calib3d.CALIB_CB_NORMALIZE_IMAGE
+            Calib3d.CALIB_CB_ADAPTIVE_THRESH + Calib3d.CALIB_CB_NORMALIZE_IMAGE,
+            Calib3d.CALIB_CB_ADAPTIVE_THRESH + Calib3d.CALIB_CB_NORMALIZE_IMAGE
                     + Calib3d.CALIB_CB_FAST_CHECK
         };
-        boolean found = false;
         for (int flags : flagSets) {
-            found = Calib3d.findChessboardCorners(gray, pattern, corners, flags);
+            MatOfPoint2f corners = new MatOfPoint2f();
+            boolean found = Calib3d.findChessboardCorners(gray, pattern, corners, flags);
             if (found && corners.total() >= (long) (pattern.width * pattern.height)) {
+                return corners;
+            }
+            corners.release();
+        }
+        try {
+            MatOfPoint2f corners = new MatOfPoint2f();
+            int sbFlags = Calib3d.CALIB_CB_EXHAUSTIVE + Calib3d.CALIB_CB_ACCURACY;
+            boolean found = Calib3d.findChessboardCornersSB(gray, pattern, corners, sbFlags);
+            if (found && corners.total() >= (long) (pattern.width * pattern.height)) {
+                return corners;
+            }
+            corners.release();
+            corners = new MatOfPoint2f();
+            found = Calib3d.findChessboardCornersSB(gray, pattern, corners);
+            if (found && corners.total() >= (long) (pattern.width * pattern.height)) {
+                return corners;
+            }
+            corners.release();
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static void refineCorners(Mat gray, MatOfPoint2f corners) {
+        Imgproc.cornerSubPix(gray, corners, new Size(7, 7), new Size(-1, -1),
+                new TermCriteria(TermCriteria.EPS + TermCriteria.COUNT, 60, 0.008));
+    }
+
+    private static final class FisheyeCalibResult {
+        Mat K;
+        Mat D;
+        List<Mat> rvecs;
+        List<Mat> tvecs;
+        double rms;
+        int droppedViews;
+    }
+
+    private static FisheyeCalibResult runRefinedFisheyeCalibrate(
+            String role, List<Mat> objectPoints, List<Mat> imagePoints,
+            int w, int h, int minViews) {
+        Mat K = Mat.eye(3, 3, CvType.CV_64F);
+        seedIntrinsicGuess(role, w, h, K);
+        Mat D = Mat.zeros(4, 1, CvType.CV_64F);
+        List<Mat> rvecs = new ArrayList<>();
+        List<Mat> tvecs = new ArrayList<>();
+
+        int flags = Calib3d.fisheye_CALIB_USE_INTRINSIC_GUESS
+                | Calib3d.fisheye_CALIB_RECOMPUTE_EXTRINSIC
+                | Calib3d.fisheye_CALIB_FIX_SKEW;
+        TermCriteria criteria = new TermCriteria(
+                TermCriteria.COUNT + TermCriteria.EPS, 250, 1e-9);
+
+        double rms;
+        try {
+            rms = Calib3d.fisheye_calibrate(
+                    objectPoints, imagePoints, new Size(w, h),
+                    K, D, rvecs, tvecs, flags, criteria);
+        } catch (CvException e) {
+            System.err.println("fisheye.calibrate failed: " + e.getMessage());
+            releaseAll(rvecs);
+            releaseAll(tvecs);
+            rvecs = new ArrayList<>();
+            tvecs = new ArrayList<>();
+            seedEquidistantGuess(w, h, K);
+            D = Mat.zeros(4, 1, CvType.CV_64F);
+            try {
+                rms = Calib3d.fisheye_calibrate(
+                        objectPoints, imagePoints, new Size(w, h),
+                        K, D, rvecs, tvecs, flags, criteria);
+                System.out.println("Recovered with equidistant intrinsic guess.");
+            } catch (CvException e2) {
+                System.err.println("fisheye.calibrate retry failed: " + e2.getMessage());
+                K.release();
+                D.release();
+                releaseAll(rvecs);
+                releaseAll(tvecs);
+                return null;
+            }
+        }
+
+        int dropped = pruneOutlierViews(objectPoints, imagePoints, K, D, rvecs, tvecs,
+                minViews);
+        if (dropped > 0 && imagePoints.size() >= minViews) {
+            releaseAll(rvecs);
+            releaseAll(tvecs);
+            rvecs = new ArrayList<>();
+            tvecs = new ArrayList<>();
+            try {
+                rms = Calib3d.fisheye_calibrate(
+                        objectPoints, imagePoints, new Size(w, h),
+                        K, D, rvecs, tvecs, flags, criteria);
+            } catch (CvException e) {
+                System.err.println("fisheye.calibrate (refine pass) failed: " + e.getMessage());
+                K.release();
+                D.release();
+                releaseAll(rvecs);
+                releaseAll(tvecs);
+                return null;
+            }
+        }
+
+        double k3 = Math.abs(getCoeff(D, 2));
+        double k4 = Math.abs(getCoeff(D, 3));
+        if (k3 + k4 > 0.85 && imagePoints.size() >= minViews) {
+            int stableFlags = flags | Calib3d.fisheye_CALIB_FIX_K3 | Calib3d.fisheye_CALIB_FIX_K4;
+            releaseAll(rvecs);
+            releaseAll(tvecs);
+            rvecs = new ArrayList<>();
+            tvecs = new ArrayList<>();
+            try {
+                rms = Calib3d.fisheye_calibrate(
+                        objectPoints, imagePoints, new Size(w, h),
+                        K, D, rvecs, tvecs, stableFlags, criteria);
+                System.out.println("Stabilized high-order distortion (FIX_K3 | FIX_K4).");
+            } catch (CvException e) {
+                System.err.println("fisheye.calibrate (stable D) failed: " + e.getMessage());
+            }
+        }
+
+        FisheyeCalibResult out = new FisheyeCalibResult();
+        out.K = K;
+        out.D = D;
+        out.rvecs = rvecs;
+        out.tvecs = tvecs;
+        out.rms = rms;
+        out.droppedViews = dropped;
+        return out;
+    }
+
+    private static void seedIntrinsicGuess(String role, int w, int h, Mat K) {
+        seedEquidistantGuess(w, h, K);
+    }
+
+    private static void seedEquidistantGuess(int w, int h, Mat K) {
+        double fGuess = VideoStreamingServer.fisheyeFocal(w, h,
+                VideoStreamingServer.INPUT_FISHEYE_FOV_DEG);
+        K.put(0, 0, fGuess);
+        K.put(1, 1, fGuess);
+        K.put(0, 2, w * VideoStreamingServer.FISHEYE_CX);
+        K.put(1, 2, h * VideoStreamingServer.FISHEYE_CY);
+    }
+
+    private static int pruneOutlierViews(List<Mat> objectPoints, List<Mat> imagePoints,
+                                         Mat K, Mat D, List<Mat> rvecs, List<Mat> tvecs,
+                                         int minViews) {
+        if (objectPoints.size() != imagePoints.size()
+                || rvecs.size() != tvecs.size()
+                || objectPoints.size() < minViews + 1) {
+            return 0;
+        }
+        List<Double> errs = new ArrayList<>();
+        for (int i = 0; i < objectPoints.size(); i++) {
+            errs.add(perViewRms(objectPoints.get(i), imagePoints.get(i),
+                    rvecs.get(i), tvecs.get(i), K, D));
+        }
+        double median = median(errs);
+        double limit = Math.max(OUTLIER_RMS_FLOOR_PX, median * OUTLIER_RMS_FACTOR);
+        int dropped = 0;
+        for (int i = objectPoints.size() - 1; i >= 0; i--) {
+            if (objectPoints.size() <= minViews) {
                 break;
             }
-            found = false;
-        }
-        if (!found) {
-            try {
-                found = Calib3d.findChessboardCornersSB(gray, pattern, corners);
-                if (!(found && corners.total() >= (long) (pattern.width * pattern.height))) {
-                    found = false;
-                }
-            } catch (Throwable ignored) {
-                found = false;
+            if (errs.get(i) > limit) {
+                objectPoints.get(i).release();
+                imagePoints.get(i).release();
+                rvecs.get(i).release();
+                tvecs.get(i).release();
+                objectPoints.remove(i);
+                imagePoints.remove(i);
+                rvecs.remove(i);
+                tvecs.remove(i);
+                dropped++;
             }
         }
-        if (!found) {
-            gray.release();
-            corners.release();
-            return null;
+        return dropped;
+    }
+
+    private static double perViewRms(Mat objectPoints, Mat imagePoints,
+                                     Mat rvec, Mat tvec, Mat K, Mat D) {
+        Mat projected = new Mat();
+        try {
+            Calib3d.fisheye_projectPoints(objectPoints, projected, rvec, tvec, K, D);
+        } catch (CvException e) {
+            projected.release();
+            return Double.POSITIVE_INFINITY;
         }
-        Imgproc.cornerSubPix(gray, corners, new Size(5, 5), new Size(-1, -1),
-                new TermCriteria(TermCriteria.EPS + TermCriteria.COUNT, 40, 0.01));
-        gray.release();
-        return corners;
+        double sum = 0;
+        int n = (int) imagePoints.total();
+        for (int i = 0; i < n; i++) {
+            double[] obs = imagePoints.get(i, 0);
+            double[] pred = projected.get(i, 0);
+            if (obs == null || pred == null || obs.length < 2 || pred.length < 2) {
+                continue;
+            }
+            double dx = obs[0] - pred[0];
+            double dy = obs[1] - pred[1];
+            sum += dx * dx + dy * dy;
+        }
+        projected.release();
+        return n > 0 ? Math.sqrt(sum / n) : Double.POSITIVE_INFINITY;
+    }
+
+    private static double median(List<Double> values) {
+        if (values == null || values.isEmpty()) {
+            return 0;
+        }
+        List<Double> sorted = new ArrayList<>(values);
+        sorted.sort(Double::compareTo);
+        int mid = sorted.size() / 2;
+        if (sorted.size() % 2 == 1) {
+            return sorted.get(mid);
+        }
+        return (sorted.get(mid - 1) + sorted.get(mid)) * 0.5;
     }
 
     static Mat chessboardObjectPoints(int cols, int rows, double squareMeters) {
@@ -560,7 +779,7 @@ public final class CalibrationManager {
     }
 
     /**
-     * Best-effort vehicle extrinsics from the largest detected board.
+     * Best-effort vehicle extrinsics from chessboard poses.
      * Assumes the board lies on the ground (Z out of board = up). Yaw stays
      * the configured camera role heading because board yaw in the world is unknown.
      */
@@ -576,51 +795,82 @@ public final class CalibrationManager {
 
         int best = 0;
         double bestSpan = -1;
+        List<Double> pitches = new ArrayList<>();
+        List<Double> rolls = new ArrayList<>();
         for (int i = 0; i < imagePoints.size() && i < rvecs.size(); i++) {
             double span = cornerSpan(imagePoints.get(i));
             if (span > bestSpan) {
                 bestSpan = span;
                 best = i;
             }
+            Mat rvec = rvecs.get(i);
+            if (rvec == null || rvec.empty()) {
+                continue;
+            }
+            Mat R = new Mat();
+            Calib3d.Rodrigues(rvec, R);
+            if (R.rows() != 3 || R.cols() != 3) {
+                R.release();
+                continue;
+            }
+            double ox = R.get(2, 0)[0];
+            double oy = R.get(2, 1)[0];
+            double oz = R.get(2, 2)[0];
+            double horiz = Math.hypot(ox, oy);
+            double lookDownDeg = Math.toDegrees(Math.atan2(-oz, Math.max(horiz, 1e-9)));
+            double pitchDeg = -lookDownDeg;
+            double xx = R.get(0, 0)[0];
+            double xy = R.get(0, 1)[0];
+            double rollDeg = Math.toDegrees(Math.atan2(xy, xx));
+            R.release();
+            if (pitchDeg >= -62 && pitchDeg <= 8) {
+                // Weight flatter boards more heavily when estimating ground pitch.
+                double flatness = Math.min(1.0, Math.abs(oz));
+                if (flatness > 0.35) {
+                    pitches.add(pitchDeg);
+                }
+                if (Math.abs(rollDeg) <= 22 && flatness > 0.35) {
+                    rolls.add(rollDeg);
+                }
+            }
         }
+
         Mat rvec = rvecs.get(best);
         Mat tvec = tvecs.get(best);
-        if (rvec == null || rvec.empty() || tvec == null || tvec.empty()) {
-            return out;
+        if (rvec != null && !rvec.empty() && tvec != null && !tvec.empty()) {
+            out.rvec = new double[] { getCoeff(rvec, 0), getCoeff(rvec, 1), getCoeff(rvec, 2) };
+            out.tvec = new double[] { getCoeff(tvec, 0), getCoeff(tvec, 1), getCoeff(tvec, 2) };
         }
-        out.rvec = new double[] { getCoeff(rvec, 0), getCoeff(rvec, 1), getCoeff(rvec, 2) };
-        out.tvec = new double[] { getCoeff(tvec, 0), getCoeff(tvec, 1), getCoeff(tvec, 2) };
 
-        Mat R = new Mat();
-        Calib3d.Rodrigues(rvec, R);
-        if (R.rows() != 3 || R.cols() != 3) {
-            R.release();
+        if (pitches.size() < 3) {
             return out;
         }
-        // Optical axis in board coordinates: R^T * [0,0,1] = third row of R.
-        double ox = R.get(2, 0)[0];
-        double oy = R.get(2, 1)[0];
-        double oz = R.get(2, 2)[0];
-        double horiz = Math.hypot(ox, oy);
-        double lookDownDeg = Math.toDegrees(Math.atan2(-oz, Math.max(horiz, 1e-9)));
-        // Camera X in board coordinates: first row of R. Roll about the optical axis.
-        double xx = R.get(0, 0)[0];
-        double xy = R.get(0, 1)[0];
-        double rollDeg = Math.toDegrees(Math.atan2(xy, xx));
-        R.release();
-
-        // Configured pitch is negative when looking at the ground.
-        double pitchDeg = -lookDownDeg;
-        if (pitchDeg < -55 || pitchDeg > 5) {
-            return out;
+        double pitchMed = median(pitches);
+        double configuredPitch = VideoStreamingServer.CAM_PITCH_DEG[camIndex];
+        double pitchSpread = spread(pitches);
+        if (pitchSpread > 9.0) {
+            // Highly tilted boards — blend toward the mount prior.
+            pitchMed = 0.35 * pitchMed + 0.65 * configuredPitch;
         }
-        if (Math.abs(rollDeg) > 25) {
-            rollDeg = VideoStreamingServer.CAM_ROLL_DEG[camIndex];
+        out.pitchDeg = pitchMed;
+        if (rolls.size() >= 3) {
+            out.rollDeg = median(rolls);
         }
-        out.pitchDeg = pitchDeg;
-        out.rollDeg = rollDeg;
         out.hasExtrinsics = true;
         return out;
+    }
+
+    private static double spread(List<Double> values) {
+        if (values == null || values.size() < 2) {
+            return 0;
+        }
+        double min = Double.POSITIVE_INFINITY;
+        double max = Double.NEGATIVE_INFINITY;
+        for (double v : values) {
+            min = Math.min(min, v);
+            max = Math.max(max, v);
+        }
+        return max - min;
     }
 
     private static double cornerSpan(Mat imagePoints) {
