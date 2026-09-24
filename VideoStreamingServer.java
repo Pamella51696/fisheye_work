@@ -16,6 +16,8 @@ import java.util.Locale;
 import java.util.concurrent.Executors;
  
 import org.opencv.core.*;
+import org.opencv.features2d.DescriptorMatcher;
+import org.opencv.features2d.ORB;
 import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.Imgproc;
 import org.opencv.videoio.VideoCapture;
@@ -29,6 +31,14 @@ import org.opencv.videoio.Videoio;
  *
  * Horizon is φ = 0 in the vehicle frame (pose), not an image-space shift.
  * Clips are discovered in the working folder (left / front / right / rear).
+ *
+ * Main calibration uses the existing clips (no checkerboard):
+ *   java VideoStreamingServer --calibrate
+ *   common overlap features → fisheye K,D → RANSAC → ground lines
+ * Checkerboard calibration is optional:
+ *   java VideoStreamingServer --calibrate-chessboard [--pattern 9x6] [--square 30mm]
+ * Production loads calib/&lt;role&gt;.json when present; otherwise the
+ * equidistant FOV model is used. Maps are built once, then remap() per frame.
  */
 public class VideoStreamingServer {
  
@@ -42,13 +52,13 @@ public class VideoStreamingServer {
     /** Vertical field around the horizon (deg). */
     private static final double PANEL_PITCH_DEG = 72.0;
     /** Equidistant fisheye input FOV used to build K when no calib file exists. */
-    private static final double INPUT_FISHEYE_FOV_DEG = 190.0;
+    static final double INPUT_FISHEYE_FOV_DEG = 190.0;
 /** Stop sampling past this angle from the lens axis — real fisheye glass
  *  degrades near the rim, so this keeps panels out of the bad zone. */
 private static final double MAX_INCIDENCE_DEG = 78.0;
 /** Optical center as a fraction of image size; 0.5/0.5 = geometric center. */
-private static final double FISHEYE_CX = 0.50;
-private static final double FISHEYE_CY = 0.50;
+    static final double FISHEYE_CX = 0.50;
+    static final double FISHEYE_CY = 0.50;
     /** Only treat near-black remap holes as invalid (keep dark asphalt). */
     private static final double INVALID_LUMA = 3.0;
     /** Minimum seam width in pixels so feeds dissolve instead of overwriting. */
@@ -57,29 +67,14 @@ private static final double FISHEYE_CY = 0.50;
     private static final int EDGE_FEATHER_PX = 100;
  
     /** Vehicle yaw of each camera, Left → Front → Right → Rear. */
-    private static final double[] CAM_YAW_DEG   = { -90.0, 0.0, 90.0, 180.0 };
+    static final double[] CAM_YAW_DEG   = { -90.0, 0.0, 90.0, 180.0 };
     /** Pitch: negative looks toward the ground (typical bumper / wing mount). */
-    private static final double[] CAM_PITCH_DEG = { -14.0, -12.0, -14.0, -21.0 };
-    private static final double[] CAM_ROLL_DEG  = {  0.0,  0.0,  0.0,   0.0 };
-    private static final String[] CAM_ROLE      = { "left", "front", "right", "rear" };
+    static final double[] CAM_PITCH_DEG = { -14.0, -12.0, -14.0, -21.0 };
+    static final double[] CAM_ROLL_DEG  = {  0.0,  0.0,  0.0,   0.0 };
+    static final String[] CAM_ROLE      = { "left", "front", "right", "rear" };
+    private static final boolean[] UNSTABLE_INTRINSICS_WARNED = new boolean[4];
  
     public static void main(String[] args) throws IOException {
-        int port = DEFAULT_PORT;
-        if (args.length >= 1) {
-            try {
-                port = Integer.parseInt(args[0]);
-            } catch (NumberFormatException e) {
-                System.err.println("First argument must be a port number, got: " + args[0]);
-                return;
-            }
-        }
- 
-        Path folder = Paths.get(".").toAbsolutePath().normalize();
-        Path[] videos = discoverClips(folder);
-        if (videos == null) {
-            return;
-        }
- 
         try {
             System.loadLibrary(Core.NATIVE_LIBRARY_NAME);
         } catch (UnsatisfiedLinkError e) {
@@ -87,14 +82,89 @@ private static final double FISHEYE_CY = 0.50;
             return;
         }
         loadFfmpegPlugin();
- 
+
+        if (LineFisheyeCalibrator.isSelfTestArgs(args)) {
+            int code = LineFisheyeCalibrator.selfTest();
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
+        if (CalibrationManager.isChessboardCalibrateArgs(args)) {
+            CalibrationManager.Options opt;
+            try {
+                opt = CalibrationManager.parseArgs(args);
+            } catch (RuntimeException e) {
+                System.err.println(e.getMessage());
+                return;
+            }
+            int code = CalibrationManager.run(opt);
+            Path calibFolder = opt.folder != null
+                    ? opt.folder : Paths.get(".").toAbsolutePath().normalize();
+            int align = alignMountPoseFromSeams(calibFolder);
+            if (code != 0 && align != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
+        if (CalibrationManager.isCalibrateArgs(args)) {
+            CalibrationManager.Options opt;
+            try {
+                opt = CalibrationManager.parseArgs(args);
+            } catch (RuntimeException e) {
+                System.err.println(e.getMessage());
+                return;
+            }
+            int code = LineFisheyeCalibrator.run(opt.folder);
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
+        if (isStitchPreviewArgs(args)) {
+            Path folder = Paths.get(".").toAbsolutePath().normalize();
+            int code = exportStitchPreview(folder);
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
+        if (CalibrationManager.isAlignMountsArgs(args)) {
+            Path folder = Paths.get(".").toAbsolutePath().normalize();
+            int code = alignMountPoseFromSeams(folder);
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
+        int port = DEFAULT_PORT;
+        Integer parsedPort = CalibrationManager.parsePort(args);
+        if (parsedPort != null) {
+            port = parsedPort;
+        } else if (args.length >= 1 && !args[0].startsWith("-")) {
+            System.err.println("First argument must be a port number or --calibrate, got: " + args[0]);
+            return;
+        }
+
+        Path folder = Paths.get(".").toAbsolutePath().normalize();
+        Path[] videos = discoverClips(folder);
+        if (videos == null) {
+            return;
+        }
+
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/stitch", new StitchHandler(videos));
         server.createContext("/play",   new PlayerPageHandler());
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
- 
+
         System.out.println("Server started  ->  http://localhost:" + port + "/play");
+        CalibrationManager.logLoadedModels();
         for (int i = 0; i < CAM_ROLE.length; i++) {
             System.out.println("  " + CAM_ROLE[i] + " = " + videos[i]
                     + "  yaw=" + CAM_YAW_DEG[i]
@@ -107,6 +177,396 @@ private static final double FISHEYE_CY = 0.50;
      * Finds left/front/right/rear clips in {@code folder}. Prefers {@code name_1.mp4}
      * then {@code name.mp4}/{@code .mov}, then any file whose name contains the role.
      */
+    static boolean isStitchPreviewArgs(String[] args) {
+        if (args == null) {
+            return false;
+        }
+        for (String a : args) {
+            if ("--stitch-preview".equals(a)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Renders one offline panorama JPEG from a still per camera (for tuning calib).
+     * Looks for calib/&lt;role&gt;/preview.jpg, then dummy_00.jpg, then any image in the folder.
+     */
+    static int exportStitchPreview(Path folder) {
+        Mat[] frames = new Mat[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            String source = loadPreviewFrame(folder, CAM_ROLE[i], frames, i);
+            if (source == null) {
+                for (Mat m : frames) {
+                    if (m != null) {
+                        m.release();
+                    }
+                }
+                return 2;
+            }
+            System.out.println("Preview source " + CAM_ROLE[i] + ": " + source);
+        }
+        Mat panorama = renderPanorama(frames, null, null);
+        for (Mat m : frames) {
+            if (m != null) {
+                m.release();
+            }
+        }
+        if (panorama == null) {
+            return 1;
+        }
+        Path out = folder.resolve("stitch_preview.jpg");
+        boolean ok = Imgcodecs.imwrite(out.toAbsolutePath().toString(), panorama);
+        panorama.release();
+        if (!ok) {
+            System.err.println("Could not write " + out);
+            return 1;
+        }
+        System.out.println("Wrote " + out.toAbsolutePath());
+        return 0;
+    }
+
+    /**
+     * Align camera mounts so the same scene point lands on the same panorama
+     * direction. Uses ORB matches between adjacent cameras (the overlap of a
+     * 360 rig). Checkerboard intrinsics, when present, supply the fisheye model
+     * that turns pixels into rays. Front-camera yaw stays fixed as the reference.
+     */
+    static int alignMountPoseFromSeams(Path folder) {
+        Path[] clips = discoverClips(folder);
+        if (clips == null) {
+            System.err.println("Mount align skipped: left/front/right/rear clips not found.");
+            return 2;
+        }
+        Mat[] frames = new Mat[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            if (!readFirstFrame(clips[i], frames, i)) {
+                System.err.println("Could not read a frame from " + clips[i]);
+                releaseFrames(frames);
+                return 2;
+            }
+        }
+
+        double[] yaw = new double[CAM_ROLE.length];
+        double[] pitch = new double[CAM_ROLE.length];
+        double[] roll = new double[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            CalibrationManager.CameraModel model = CalibrationManager.load(CAM_ROLE[i]);
+            double[] pose = CalibrationManager.mountDegreesForStitch(
+                    i, model, Double.NaN, Double.NaN);
+            yaw[i] = pose[0];
+            pitch[i] = pose[1];
+            roll[i] = pose[2];
+        }
+
+        List<RayMatch> matches = collectAdjacentRayMatches(frames);
+        System.out.println("Cross-camera feature matches: " + matches.size());
+        if (matches.size() < 12) {
+            System.err.println("Not enough overlap matches to solve mount pose.");
+            System.err.println("Place the rig so neighboring cameras see the same street/vehicles,");
+            System.err.println("or capture a checkerboard large enough to appear in two cameras at once.");
+            releaseFrames(frames);
+            return 2;
+        }
+
+        double before = featurePoseCost(matches, yaw, pitch, roll);
+        System.out.printf(Locale.US, "Feature ray error before align: %.3f deg%n", before);
+
+        double[] yawStep = { 4.0, 1.0 };
+        double[] pitchStep = { 4.0, 1.0 };
+        double[] rollStep = { 2.0, 0.5 };
+        double[] yawRange = { 16.0, 4.0 };
+        double[] pitchRange = { 16.0, 4.0 };
+        double[] rollRange = { 6.0, 2.0 };
+        for (int pass = 0; pass < 2; pass++) {
+            for (int cam = 0; cam < CAM_ROLE.length; cam++) {
+                double baseYaw = yaw[cam];
+                double basePitch = pitch[cam];
+                double baseRoll = roll[cam];
+                double bestYaw = baseYaw;
+                double bestPitch = basePitch;
+                double bestRoll = baseRoll;
+                double best = featurePoseCost(matches, yaw, pitch, roll);
+                boolean lockYaw = cam == 1;
+                for (double dy = lockYaw ? 0 : -yawRange[pass]; dy <= yawRange[pass] + 1e-6; dy += yawStep[pass]) {
+                    for (double dp = -pitchRange[pass]; dp <= pitchRange[pass] + 1e-6; dp += pitchStep[pass]) {
+                        for (double dr = -rollRange[pass]; dr <= rollRange[pass] + 1e-6; dr += rollStep[pass]) {
+                            yaw[cam] = baseYaw + dy;
+                            pitch[cam] = basePitch + dp;
+                            roll[cam] = baseRoll + dr;
+                            double score = featurePoseCost(matches, yaw, pitch, roll);
+                            if (score < best) {
+                                best = score;
+                                bestYaw = yaw[cam];
+                                bestPitch = pitch[cam];
+                                bestRoll = roll[cam];
+                            }
+                        }
+                    }
+                }
+                yaw[cam] = bestYaw;
+                pitch[cam] = bestPitch;
+                roll[cam] = bestRoll;
+                System.out.printf(Locale.US,
+                        "  %s pass %d: yaw=%.2f pitch=%.2f roll=%.2f  err=%.3f deg%n",
+                        CAM_ROLE[cam], pass + 1, yaw[cam], pitch[cam], roll[cam], best);
+            }
+        }
+
+        double after = featurePoseCost(matches, yaw, pitch, roll);
+        System.out.printf(Locale.US, "Feature ray error after align: %.3f deg%n", after);
+        if (after > before - 0.05) {
+            System.out.println("Align did not improve the fit; keeping the previous mount pose.");
+            releaseFrames(frames);
+            return 0;
+        }
+
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            if (!CalibrationManager.saveMountPose(CAM_ROLE[i], yaw[i], pitch[i], roll[i])) {
+                releaseFrames(frames);
+                return 1;
+            }
+        }
+        releaseFrames(frames);
+        System.out.println("Mount pose saved to calib/*.json (hasExtrinsics=true).");
+        System.out.println("Next: java VideoStreamingServer --stitch-preview");
+        return 0;
+    }
+
+    private static final class RayMatch {
+        final int a;
+        final int b;
+        final double[] rayA;
+        final double[] rayB;
+
+        RayMatch(int a, int b, double[] rayA, double[] rayB) {
+            this.a = a;
+            this.b = b;
+            this.rayA = rayA;
+            this.rayB = rayB;
+        }
+    }
+
+    private static List<RayMatch> collectAdjacentRayMatches(Mat[] frames) {
+        List<RayMatch> out = new ArrayList<>();
+        ORB orb = ORB.create(2000);
+        DescriptorMatcher matcher = DescriptorMatcher.create(DescriptorMatcher.BRUTEFORCE_HAMMING);
+        Mat[] gray = new Mat[frames.length];
+        MatOfKeyPoint[] keys = new MatOfKeyPoint[frames.length];
+        Mat[] desc = new Mat[frames.length];
+        for (int i = 0; i < frames.length; i++) {
+            gray[i] = new Mat();
+            Imgproc.cvtColor(frames[i], gray[i], Imgproc.COLOR_BGR2GRAY);
+            keys[i] = new MatOfKeyPoint();
+            desc[i] = new Mat();
+            orb.detectAndCompute(gray[i], new Mat(), keys[i], desc[i]);
+        }
+        for (int i = 0; i < frames.length - 1; i++) {
+            if (desc[i].empty() || desc[i + 1].empty()) {
+                continue;
+            }
+            List<MatOfDMatch> knn = new ArrayList<>();
+            matcher.knnMatch(desc[i], desc[i + 1], knn, 2);
+            KeyPoint[] ka = keys[i].toArray();
+            KeyPoint[] kb = keys[i + 1].toArray();
+            double[][] nominal = new double[2][];
+            nominal[0] = cameraToVehicle(CAM_YAW_DEG[i], CAM_PITCH_DEG[i], CAM_ROLL_DEG[i]);
+            nominal[1] = cameraToVehicle(CAM_YAW_DEG[i + 1], CAM_PITCH_DEG[i + 1], CAM_ROLL_DEG[i + 1]);
+            for (MatOfDMatch pair : knn) {
+                DMatch[] dm = pair.toArray();
+                if (dm.length < 2 || dm[0].distance > 0.75 * dm[1].distance) {
+                    continue;
+                }
+                KeyPoint pa = ka[dm[0].queryIdx];
+                KeyPoint pb = kb[dm[0].trainIdx];
+                double[] rayA = pixelToCameraRay(frames[i], i, pa.pt.x, pa.pt.y);
+                double[] rayB = pixelToCameraRay(frames[i + 1], i + 1, pb.pt.x, pb.pt.y);
+                if (rayA == null || rayB == null) {
+                    continue;
+                }
+                double[] va = mulMatVec(nominal[0], rayA);
+                double[] vb = mulMatVec(nominal[1], rayB);
+                if (angleDeg(va, vb) > 40.0) {
+                    continue;
+                }
+                out.add(new RayMatch(i, i + 1, rayA, rayB));
+            }
+        }
+        for (int i = 0; i < frames.length; i++) {
+            gray[i].release();
+            keys[i].release();
+            desc[i].release();
+        }
+        return out;
+    }
+
+    private static double[] pixelToCameraRay(Mat frame, int cam, double u, double v) {
+        CalibrationManager.CameraModel model = CalibrationManager.load(CAM_ROLE[cam]);
+        double f = fisheyeFocal(frame.cols(), frame.rows(), INPUT_FISHEYE_FOV_DEG);
+        double[] K = (model != null && model.hasIntrinsics)
+                ? model.scaledK(frame.cols(), frame.rows())
+                : new double[] { f, f, frame.cols() * FISHEYE_CX, frame.rows() * FISHEYE_CY };
+        double k1 = model != null && model.hasIntrinsics ? model.k1 : 0;
+        double k2 = model != null && model.hasIntrinsics ? model.k2 : 0;
+        double k3 = model != null && model.hasIntrinsics ? model.k3 : 0;
+        double k4 = model != null && model.hasIntrinsics ? model.k4 : 0;
+        return CalibrationManager.unprojectFisheye(u, v, K, k1, k2, k3, k4);
+    }
+
+    private static double featurePoseCost(List<RayMatch> matches,
+                                          double[] yaw, double[] pitch, double[] roll) {
+        double[][] r = new double[yaw.length][];
+        for (int i = 0; i < yaw.length; i++) {
+            r[i] = cameraToVehicle(yaw[i], pitch[i], roll[i]);
+        }
+        double sum = 0;
+        int n = 0;
+        for (RayMatch m : matches) {
+            double ang = angleDeg(mulMatVec(r[m.a], m.rayA), mulMatVec(r[m.b], m.rayB));
+            sum += Math.min(ang, 15.0);
+            n++;
+        }
+        if (n == 0) {
+            return 1e6;
+        }
+        double prior = 0;
+        for (int i = 0; i < yaw.length; i++) {
+            prior += Math.abs(yaw[i] - CAM_YAW_DEG[i]) * 0.02;
+            prior += Math.abs(pitch[i] - CAM_PITCH_DEG[i]) * 0.02;
+            prior += Math.abs(roll[i] - CAM_ROLL_DEG[i]) * 0.02;
+        }
+        return sum / n + prior;
+    }
+
+    private static double[] mulMatVec(double[] r, double[] v) {
+        return new double[] {
+            r[0] * v[0] + r[1] * v[1] + r[2] * v[2],
+            r[3] * v[0] + r[4] * v[1] + r[5] * v[2],
+            r[6] * v[0] + r[7] * v[1] + r[8] * v[2]
+        };
+    }
+
+    private static double angleDeg(double[] a, double[] b) {
+        double na = Math.hypot(a[0], Math.hypot(a[1], a[2]));
+        double nb = Math.hypot(b[0], Math.hypot(b[1], b[2]));
+        if (na < 1e-9 || nb < 1e-9) {
+            return 180;
+        }
+        double dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (na * nb);
+        if (dot > 1) {
+            dot = 1;
+        }
+        if (dot < -1) {
+            dot = -1;
+        }
+        return Math.toDegrees(Math.acos(dot));
+    }
+
+    private static void releaseFrames(Mat[] frames) {
+        if (frames == null) {
+            return;
+        }
+        for (Mat frame : frames) {
+            if (frame != null) {
+                frame.release();
+            }
+        }
+    }
+
+    private static boolean readFirstFrame(Path clip, Mat[] frames, int index) {
+        Path decodable = ensureDecodable(clip);
+        VideoCapture cap = openVideo(decodable);
+        if (cap == null || !cap.isOpened()) {
+            return false;
+        }
+        Mat frame = new Mat();
+        boolean ok = readBgr(cap, frame) && !frame.empty();
+        cap.release();
+        if (!ok) {
+            frame.release();
+            return false;
+        }
+        frames[index] = frame;
+        return true;
+    }
+
+    private static String loadPreviewFrame(Path folder, String role, Mat[] frames, int index) {
+        Path clip = findClip(folder, role);
+        if (clip != null && readFirstFrame(ensureDecodable(clip), frames, index)) {
+            return clip.getFileName().toString() + " (first frame)";
+        }
+        Path still = findCalibStill(folder, role);
+        if (still == null) {
+            System.err.println("No preview for " + role
+                    + " (need " + role + "_1.mp4 or calib/" + role + "/ still)");
+            return null;
+        }
+        Mat bgr = Imgcodecs.imread(still.toAbsolutePath().toString());
+        if (bgr == null || bgr.empty()) {
+            System.err.println("Could not read " + still);
+            return null;
+        }
+        frames[index] = bgr;
+        return still.getFileName().toString();
+    }
+
+    static Mat renderPanorama(Mat[] frames, double[] pitchDeg, double[] rollDeg) {
+        if (frames == null || frames.length != CAM_ROLE.length) {
+            return null;
+        }
+        Mat[] ready = new Mat[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            if (frames[i] == null || frames[i].empty()) {
+                for (Mat m : ready) {
+                    if (m != null) {
+                        m.release();
+                    }
+                }
+                return null;
+            }
+            double p = pitchDeg != null ? pitchDeg[i] : Double.NaN;
+            double r = rollDeg != null ? rollDeg[i] : Double.NaN;
+            SphericalPanel panel = new SphericalPanel(i, Double.NaN, p, r);
+            ready[i] = new Mat();
+            panel.project(frames[i], ready[i]);
+        }
+        int overlap = panelOverlapPx();
+        Mat panorama = featherStitch(ready, overlap);
+        for (Mat m : ready) {
+            m.release();
+        }
+        return panorama;
+    }
+
+
+    private static Path findCalibStill(Path folder, String role) {
+        Path dir = folder.resolve(CalibrationManager.CALIB_DIR).resolve(role);
+        Path[] preferred = {
+            dir.resolve("preview.jpg"),
+            dir.resolve("dummy_00.jpg"),
+            dir.resolve("frame_00.jpg")
+        };
+        for (Path p : preferred) {
+            if (isUsableFile(p)) {
+                return p;
+            }
+        }
+        if (!Files.isDirectory(dir)) {
+            return null;
+        }
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
+            for (Path p : stream) {
+                String n = p.getFileName().toString().toLowerCase(Locale.ROOT);
+                if (n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png")) {
+                    return p;
+                }
+            }
+        } catch (IOException ignored) {
+        }
+        return null;
+    }
+
     static Path[] discoverClips(Path folder) {
         Path[] found = new Path[4];
         for (int i = 0; i < CAM_ROLE.length; i++) {
@@ -263,15 +723,37 @@ private static final double FISHEYE_CY = 0.50;
     static final class SphericalPanel {
         private final int index;
         private final double[] R; // camera-to-vehicle, row-major
+        private final CalibrationManager.CameraModel calib;
         private Mat map1;
         private Mat map2;
         private int cachedSrcW = -1;
         private int cachedSrcH = -1;
  
+        private final double mountYawDeg;
+        private final double mountPitchDeg;
+        private final double mountRollDeg;
+
         SphericalPanel(int index) {
+            this(index, Double.NaN, Double.NaN, Double.NaN);
+        }
+
+        /**
+         * Overrides are absolute mount degrees. NaN keeps the calibrated or default
+         * mount. The panorama window stays on the nominal camera yaw so a yaw
+         * correction slides image content instead of moving the panel with it.
+         */
+        SphericalPanel(int index, double yawOverride, double pitchOverride, double rollOverride) {
             this.index = index;
-            this.R = cameraToVehicle(CAM_YAW_DEG[index],
-                    CAM_PITCH_DEG[index], CAM_ROLL_DEG[index]);
+            this.calib = CalibrationManager.load(CAM_ROLE[index]);
+            double[] pose = CalibrationManager.mountDegreesForStitch(
+                    index, this.calib, pitchOverride, rollOverride);
+            if (!Double.isNaN(yawOverride)) {
+                pose[0] = yawOverride;
+            }
+            this.mountYawDeg = pose[0];
+            this.mountPitchDeg = pose[1];
+            this.mountRollDeg = pose[2];
+            this.R = cameraToVehicle(mountYawDeg, mountPitchDeg, mountRollDeg);
         }
  
         void project(Mat src, Mat dst) {
@@ -282,15 +764,29 @@ private static final double FISHEYE_CY = 0.50;
             Imgproc.remap(src, dst, map1, map2, Imgproc.INTER_LINEAR,
                     Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
         }
- 
+
         private void ensureMaps(int srcW, int srcH) {
             if (map1 != null && srcW == cachedSrcW && srcH == cachedSrcH) {
                 return;
             }
+            boolean useCalib = CalibrationManager.stableIntrinsics(calib);
+            if (calib != null && calib.hasIntrinsics && !useCalib
+                    && !UNSTABLE_INTRINSICS_WARNED[index]) {
+                UNSTABLE_INTRINSICS_WARNED[index] = true;
+                System.out.println("  calib " + CAM_ROLE[index]
+                        + ": distortion would warp the image, using equidistant lens");
+            }
             double f = fisheyeFocal(srcW, srcH, INPUT_FISHEYE_FOV_DEG);
-double cx = srcW * FISHEYE_CX;
-double cy = srcH * FISHEYE_CY;
-double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
+            double[] K = useCalib
+                    ? calib.scaledK(srcW, srcH)
+                    : new double[] { f, f, srcW * FISHEYE_CX, srcH * FISHEYE_CY };
+            double k1 = useCalib ? calib.k1 : 0.0;
+            double k2 = useCalib ? calib.k2 : 0.0;
+            double k3 = useCalib ? calib.k3 : 0.0;
+            double k4 = useCalib ? calib.k4 : 0.0;
+            double cx = K[2];
+            double cy = K[3];
+            double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
             double yaw0 = Math.toRadians(CAM_YAW_DEG[index]);
             double yawSpan = Math.toRadians(PANEL_YAW_DEG);
             double pitchSpan = Math.toRadians(PANEL_PITCH_DEG);
@@ -327,10 +823,24 @@ double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
                         rowY[u] = -1f;
                         continue;
                     }
-                    double r = fisheyeRadius(inc, f);
-                    double az = Math.atan2(yc, xc);
-                    float su = (float) (cx + r * Math.cos(az));
-                    float sv = (float) (cy + r * Math.sin(az));
+                    float su;
+                    float sv;
+                    if (useCalib) {
+                        float[] uv = CalibrationManager.projectFisheye(
+                                xc, yc, zc, K, k1, k2, k3, k4);
+                        if (uv == null) {
+                            rowX[u] = -1f;
+                            rowY[u] = -1f;
+                            continue;
+                        }
+                        su = uv[0];
+                        sv = uv[1];
+                    } else {
+                        double r = fisheyeRadius(inc, f);
+                        double az = Math.atan2(yc, xc);
+                        su = (float) (cx + r * Math.cos(az));
+                        sv = (float) (cy + r * Math.sin(az));
+                    }
                     if (su < 1 || sv < 1 || su >= srcW - 1 || sv >= srcH - 1) {
                         rowX[u] = -1f;
                         rowY[u] = -1f;
@@ -351,6 +861,99 @@ double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
             cachedSrcW = srcW;
             cachedSrcH = srcH;
         }
+
+        double[] sourceAt(double pu, double pv, int srcW, int srcH) {
+            boolean useCalib = CalibrationManager.stableIntrinsics(calib);
+            double f = fisheyeFocal(srcW, srcH, INPUT_FISHEYE_FOV_DEG);
+            double[] k = useCalib
+                    ? calib.scaledK(srcW, srcH)
+                    : new double[] { f, f, srcW * FISHEYE_CX, srcH * FISHEYE_CY };
+            double k1 = useCalib ? calib.k1 : 0;
+            double k2 = useCalib ? calib.k2 : 0;
+            double k3 = useCalib ? calib.k3 : 0;
+            double k4 = useCalib ? calib.k4 : 0;
+            int u = (int) Math.round(pu);
+            int v = (int) Math.round(pv);
+            if (u < 0 || v < 0 || u >= PANEL_WIDTH || v >= PANEL_HEIGHT) {
+                return null;
+            }
+            double yaw0 = Math.toRadians(CAM_YAW_DEG[index]);
+            double yawSpan = Math.toRadians(PANEL_YAW_DEG);
+            double pitchSpan = Math.toRadians(PANEL_PITCH_DEG);
+            double horizonY = HORIZON_FRACTION * PANEL_HEIGHT;
+            double phi = (horizonY - v) / PANEL_HEIGHT * pitchSpan;
+            double theta = yaw0 + ((u + 0.5) / PANEL_WIDTH - 0.5) * yawSpan;
+            double xv = Math.cos(phi) * Math.cos(theta);
+            double yv = Math.cos(phi) * Math.sin(theta);
+            double zv = Math.sin(phi);
+            double xc = R[0] * xv + R[3] * yv + R[6] * zv;
+            double yc = R[1] * xv + R[4] * yv + R[7] * zv;
+            double zc = R[2] * xv + R[5] * yv + R[8] * zv;
+            if (zc <= 1e-4) {
+                return null;
+            }
+            float su;
+            float sv;
+            if (useCalib) {
+                float[] uv = CalibrationManager.projectFisheye(xc, yc, zc, k, k1, k2, k3, k4);
+                if (uv == null) {
+                    return null;
+                }
+                su = uv[0];
+                sv = uv[1];
+            } else {
+                double inc = Math.atan2(Math.hypot(xc, yc), zc);
+                double radius = fisheyeRadius(inc, f);
+                double az = Math.atan2(yc, xc);
+                su = (float) (k[2] + radius * Math.cos(az));
+                sv = (float) (k[3] + radius * Math.sin(az));
+            }
+            if (su < 1 || sv < 1 || su >= srcW - 1 || sv >= srcH - 1) {
+                return null;
+            }
+            return new double[] { su, sv };
+        }
+    }
+
+    /** One spherical panel, used by the line-calibration projection stage. */
+    static Mat projectPanel(Mat src, int index) {
+        return projectPanel(src, index, Double.NaN, Double.NaN, Double.NaN);
+    }
+
+    static Mat projectPanel(Mat src, int index, double yaw, double pitch, double roll) {
+        SphericalPanel panel = new SphericalPanel(index, yaw, pitch, roll);
+        Mat dst = new Mat();
+        panel.project(src, dst);
+        return dst;
+    }
+
+    /** Fisheye pixel sampled by one spherical-panel pixel at the given mount pose. */
+    static double[] sourcePixel(int index, double pu, double pv, int srcW, int srcH,
+                                double yaw, double pitch, double roll) {
+        SphericalPanel panel = new SphericalPanel(index, yaw, pitch, roll);
+        return panel.sourceAt(pu, pv, srcW, srcH);
+    }
+
+    /** Panorama location of a camera-frame ray. X is continuous across the four panels. */
+    static double[] panoramaXY(int cam, double[] camRay, double yaw, double pitch, double roll) {
+        double[] r = cameraToVehicle(yaw, pitch, roll);
+        double xv = r[0] * camRay[0] + r[1] * camRay[1] + r[2] * camRay[2];
+        double yv = r[3] * camRay[0] + r[4] * camRay[1] + r[5] * camRay[2];
+        double zv = r[6] * camRay[0] + r[7] * camRay[1] + r[8] * camRay[2];
+        double theta = Math.atan2(yv, xv);
+        double yaw0 = Math.toRadians(CAM_YAW_DEG[cam]);
+        while (theta - yaw0 > Math.PI) {
+            theta -= 2 * Math.PI;
+        }
+        while (yaw0 - theta > Math.PI) {
+            theta += 2 * Math.PI;
+        }
+        double yawSpan = Math.toRadians(PANEL_YAW_DEG);
+        double u = ((theta - yaw0) / yawSpan + 0.5) * PANEL_WIDTH;
+        double phi = Math.atan2(zv, Math.hypot(xv, yv));
+        double row = HORIZON_FRACTION * PANEL_HEIGHT - phi / Math.toRadians(PANEL_PITCH_DEG) * PANEL_HEIGHT;
+        double x = cam * (PANEL_WIDTH - panelOverlapPx()) + u;
+        return new double[] { x, row };
     }
  
     /**
@@ -420,10 +1023,12 @@ double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
     return focal * incidence; // pure equidistant, no distortion terms yet
 }
  
-        static int panelOverlapPx() {
-        // MIN_BLEND_PX is now the actual seam width used, not just a floor —
-        // this directly controls how wide the ghost/blend zone is.
-        return Math.max(16, Math.min(PANEL_WIDTH / 3, MIN_BLEND_PX));
+    static int panelOverlapPx() {
+        // Adjacent cameras are 90° apart. A wider panel FOV must be blended
+        // across that extra angle, or the seam joins two different directions.
+        double extraDeg = PANEL_YAW_DEG - 90.0;
+        int geometric = (int) Math.round(PANEL_WIDTH * extraDeg / PANEL_YAW_DEG);
+        return Math.max(MIN_BLEND_PX, Math.min(PANEL_WIDTH / 2, geometric));
     }
  
     static Mat featherStitch(Mat[] frames, int overlap) {
@@ -530,22 +1135,43 @@ double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
         if (overlap <= 0) {
             return mask;
         }
+        int feather = Math.min(36, overlap);
+        int center0 = Math.max(0, (overlap - feather) / 2);
         for (int x = 0; x < overlap; x++) {
-            double cosine = 0.5 - 0.5 * Math.cos(Math.PI * x / overlap);
             if (fadeLeft) {
-                float alpha = (float) Math.pow(cosine, inExp);
+                float alpha = seamWeight(x, center0, feather, true, inExp);
                 Mat colL = mask.col(x);
                 colL.setTo(new Scalar(alpha));
                 colL.release();
             }
             if (fadeRight) {
-                float alpha = (float) Math.pow(cosine, outExp);
+                int offset = overlap - 1 - x;
+                float alpha = seamWeight(offset, center0, feather, false, outExp);
                 Mat colR = mask.col(W - 1 - x);
                 colR.setTo(new Scalar(alpha));
                 colR.release();
             }
         }
         return mask;
+    }
+
+    /** One camera owns each side of a wide overlap; only the center band mixes. */
+    private static float seamWeight(int offset, int center0, int feather,
+                                    boolean fadeIn, double exp) {
+        double w;
+        if (offset < center0) {
+            w = fadeIn ? 0 : 1;
+        } else if (offset >= center0 + feather) {
+            w = fadeIn ? 1 : 0;
+        } else {
+            double t = (offset - center0) / (double) feather;
+            double cosine = 0.5 - 0.5 * Math.cos(Math.PI * t);
+            w = fadeIn ? cosine : 1.0 - cosine;
+        }
+        if (exp > 0 && exp != 1.0 && w > 0 && w < 1) {
+            w = fadeIn ? Math.pow(w, exp) : 1.0 - Math.pow(1.0 - w, exp);
+        }
+        return (float) w;
     }
  
         static Mat edgeDistanceWeight(Mat bgr, int radius) {
