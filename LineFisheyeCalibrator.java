@@ -10,6 +10,7 @@ import org.opencv.core.MatOfDMatch;
 import org.opencv.core.MatOfKeyPoint;
 import org.opencv.core.Point;
 import org.opencv.core.Scalar;
+import org.opencv.features2d.AKAZE;
 import org.opencv.features2d.DescriptorMatcher;
 import org.opencv.features2d.ORB;
 import org.opencv.imgproc.Imgproc;
@@ -21,15 +22,11 @@ import org.opencv.videoio.Videoio;
  * Main calibration path. Uses the existing surround clips, not a checkerboard.
  *
  *   existing video
- *     → fisheye initialization
- *     → straight-line calibration
- *     → initial K,D
- *     → undistortion / projection
- *     → ORB feature matching
- *     → RANSAC
- *     → extrinsic refinement
- *     → ground-line optimization
- *     → final calibration
+ *     → AKAZE + ORB features in each camera
+ *     → common features in the overlap
+ *     → undistortion (K,D) from those shared points
+ *     → straight-line fit only if the overlap has too few points
+ *     → projection, RANSAC, ground lines
  *
  * Checkerboard calibration stays available as {@code --calibrate-chessboard}.
  */
@@ -51,7 +48,7 @@ public final class LineFisheyeCalibrator {
 
     static int run(java.nio.file.Path folder) {
         System.out.println("LINE CALIBRATION (main)");
-        System.out.println("Existing video → straight lines → K,D → ORB → RANSAC → ground lines");
+        System.out.println("Existing video → common features → undistortion K,D → RANSAC → ground lines");
         System.out.println("Working folder: " + folder);
         System.out.println();
 
@@ -65,6 +62,7 @@ public final class LineFisheyeCalibrator {
         @SuppressWarnings("unchecked")
         List<Chain>[] chains = new List[4];
         Mat[] preview = new Mat[4];
+        Mat[] extra = new Mat[4];
         for (int i = 0; i < 4; i++) {
             String role = VideoStreamingServer.CAM_ROLE[i];
             System.out.println("── " + role.toUpperCase(Locale.ROOT) + " ──");
@@ -75,35 +73,76 @@ public final class LineFisheyeCalibrator {
                 continue;
             }
             preview[i] = frames.get(0);
-            int w = frames.get(0).cols();
-            int h = frames.get(0).rows();
-            Fit fit = fitCamera(frames, w, h);
-            chains[i] = fit.chains;
-            if (fit.accepted) {
-                CalibrationManager.CameraModel model = new CalibrationManager.CameraModel(
-                        role, w, h, fit.rmsDeg, fit.f, fit.f, fit.cx, fit.cy,
-                        fit.k1, fit.k2, fit.k3, fit.k4,
-                        true, false,
-                        VideoStreamingServer.CAM_YAW_DEG[i],
-                        VideoStreamingServer.CAM_PITCH_DEG[i],
-                        VideoStreamingServer.CAM_ROLL_DEG[i],
-                        new double[] {0, 0, 0}, new double[] {0, 0, 0});
-                if (CalibrationManager.save(model)) {
-                    saved++;
-                    wrote[i] = true;
-                    System.out.printf(Locale.US,
-                            "initial K,D  f=%.2f cx=%.1f cy=%.1f  D=[%.4f %.4f %.4f %.4f]  line-rms=%.3f deg%n",
-                            fit.f, fit.cx, fit.cy, fit.k1, fit.k2, fit.k3, fit.k4, fit.rmsDeg);
-                }
-            } else {
-                System.err.println("Straight-line fit did not beat the FOV initialization for " + role + ".");
-                System.err.println("Extrinsics will use the equidistant model. "
-                        + "A checkerboard pass is available: --calibrate-chessboard");
+            if (frames.size() > 2) {
+                extra[i] = frames.get(2);
             }
             for (int f = 1; f < frames.size(); f++) {
-                frames.get(f).release();
+                if (frames.get(f) != extra[i]) {
+                    frames.get(f).release();
+                }
             }
+            chains[i] = detectChains(preview[i]);
             System.out.println();
+        }
+
+        Fit[] lenses = new Fit[4];
+        for (int i = 0; i < 4; i++) {
+            lenses[i] = initialLens(preview[i]);
+        }
+        System.out.println("common features in individual cameras");
+        List<PixelMatch> common = findCommonFeatures(preview);
+        if (common.size() < 12) {
+            List<PixelMatch> more = findCommonFeatures(extra);
+            common.addAll(more);
+        }
+        System.out.println("  common features: " + common.size());
+        boolean featureFit = false;
+        if (common.size() >= 12) {
+            System.out.println("undistortion from common features");
+            featureFit = fitUndistortion(common, lenses);
+        }
+        if (!featureFit) {
+            System.out.println("Not enough shared points for a feature undistortion.");
+            System.out.println("Falling back to straight-line calibration.");
+            for (int i = 0; i < 4; i++) {
+                if (preview[i] == null) {
+                    continue;
+                }
+                List<Mat> one = new ArrayList<>();
+                one.add(preview[i]);
+                Fit line = fitCamera(one, preview[i].cols(), preview[i].rows());
+                if (line.accepted) {
+                    lenses[i] = line;
+                    chains[i] = line.chains;
+                }
+            }
+        }
+        for (int i = 0; i < 4; i++) {
+            if (preview[i] == null || lenses[i] == null || !lenses[i].accepted) {
+                continue;
+            }
+            String role = VideoStreamingServer.CAM_ROLE[i];
+            Fit fit = lenses[i];
+            CalibrationManager.CameraModel model = new CalibrationManager.CameraModel(
+                    role, preview[i].cols(), preview[i].rows(), fit.rmsDeg,
+                    fit.f, fit.f, fit.cx, fit.cy, fit.k1, fit.k2, 0, 0,
+                    true, false,
+                    VideoStreamingServer.CAM_YAW_DEG[i],
+                    VideoStreamingServer.CAM_PITCH_DEG[i],
+                    VideoStreamingServer.CAM_ROLL_DEG[i],
+                    new double[] {0, 0, 0}, new double[] {0, 0, 0});
+            if (!CalibrationManager.stableIntrinsics(model)) {
+                System.out.println("  " + role + ": fit kept in equidistant range, not saved");
+                lenses[i].accepted = false;
+                continue;
+            }
+            if (CalibrationManager.save(model)) {
+                saved++;
+                wrote[i] = true;
+                System.out.printf(Locale.US,
+                        "K,D %s  f=%.2f cx=%.1f cy=%.1f  D=[%.4f %.4f 0 0]  error=%.3f deg%n",
+                        role, fit.f, fit.cx, fit.cy, fit.k1, fit.k2, fit.rmsDeg);
+            }
         }
 
         System.out.println("undistortion/projection");
@@ -119,8 +158,8 @@ public final class LineFisheyeCalibrator {
         }
         System.out.println();
 
-        System.out.println("ORB feature matching");
-        List<RayMatch> matches = matchAdjacent(preview);
+        System.out.println("feature rays for extrinsics");
+        List<RayMatch> matches = raysFromCommon(common, lenses);
         System.out.println("  matches: " + matches.size());
         if (matches.size() >= 12) {
             double[] yaw = new double[4];
@@ -160,13 +199,16 @@ public final class LineFisheyeCalibrator {
             System.err.println("Intrinsics were still saved when the line fit succeeded.");
         }
 
-        for (Mat m : preview) {
-            if (m != null) {
-                m.release();
+        for (int i = 0; i < 4; i++) {
+            if (preview[i] != null) {
+                preview[i].release();
+            }
+            if (extra[i] != null) {
+                extra[i].release();
             }
         }
         System.out.println();
-        System.out.println("Line calibration finished. cameras with a line-based K,D: " + saved);
+        System.out.println("Calibration finished. cameras saved: " + saved);
         return saved > 0 || matches.size() >= 12 ? 0 : 2;
     }
 
@@ -186,6 +228,24 @@ public final class LineFisheyeCalibrator {
         List<Chain> chains = new ArrayList<>();
     }
 
+    private static final class PixelMatch {
+        final int a;
+        final int b;
+        final double ua;
+        final double va;
+        final double ub;
+        final double vb;
+
+        PixelMatch(int a, int b, double ua, double va, double ub, double vb) {
+            this.a = a;
+            this.b = b;
+            this.ua = ua;
+            this.va = va;
+            this.ub = ub;
+            this.vb = vb;
+        }
+    }
+
     private static final class RayMatch {
         final int a;
         final int b;
@@ -198,6 +258,295 @@ public final class LineFisheyeCalibrator {
             this.rayA = rayA;
             this.rayB = rayB;
         }
+    }
+
+    private static Fit initialLens(Mat frame) {
+        Fit fit = new Fit();
+        if (frame == null || frame.empty()) {
+            return fit;
+        }
+        int w = frame.cols();
+        int h = frame.rows();
+        fit.f = VideoStreamingServer.fisheyeFocal(w, h, VideoStreamingServer.INPUT_FISHEYE_FOV_DEG);
+        fit.cx = w * VideoStreamingServer.FISHEYE_CX;
+        fit.cy = h * VideoStreamingServer.FISHEYE_CY;
+        return fit;
+    }
+
+    /**
+     * AKAZE and ORB on the overlap side of each camera. A point kept here is
+     * visible in two feeds, which is what the undistortion fit uses.
+     */
+    private static List<PixelMatch> findCommonFeatures(Mat[] frames) {
+        List<PixelMatch> out = new ArrayList<>();
+        if (frames == null) {
+            return out;
+        }
+        for (int i = 0; i < 3; i++) {
+            if (frames[i] == null || frames[i + 1] == null
+                    || frames[i].empty() || frames[i + 1].empty()) {
+                continue;
+            }
+            int before = out.size();
+            matchOverlap(frames[i], frames[i + 1], i, i + 1, out);
+            System.out.println("  " + VideoStreamingServer.CAM_ROLE[i] + "–"
+                    + VideoStreamingServer.CAM_ROLE[i + 1] + "  +" + (out.size() - before));
+        }
+        return out;
+    }
+
+    private static void matchOverlap(Mat left, Mat right, int camA, int camB, List<PixelMatch> out) {
+        Mat grayA = new Mat();
+        Mat grayB = new Mat();
+        Imgproc.cvtColor(left, grayA, Imgproc.COLOR_BGR2GRAY);
+        Imgproc.cvtColor(right, grayB, Imgproc.COLOR_BGR2GRAY);
+        Mat maskA = overlapMask(grayA.rows(), grayA.cols(), true);
+        Mat maskB = overlapMask(grayB.rows(), grayB.cols(), false);
+        collectDetectorMatches("AKAZE", grayA, grayB, maskA, maskB, left, right, camA, camB, out);
+        collectDetectorMatches("ORB", grayA, grayB, maskA, maskB, left, right, camA, camB, out);
+        grayA.release();
+        grayB.release();
+        maskA.release();
+        maskB.release();
+    }
+
+    private static Mat overlapMask(int h, int w, boolean rightSide) {
+        Mat mask = Mat.zeros(h, w, CvType.CV_8UC1);
+        int x0 = rightSide ? (int) (w * 0.38) : 0;
+        int x1 = rightSide ? w - 1 : (int) (w * 0.62);
+        Imgproc.rectangle(mask, new Point(x0, 0), new Point(Math.max(x0 + 1, x1), h - 1),
+                new Scalar(255), Imgproc.FILLED);
+        return mask;
+    }
+
+    private static void collectDetectorMatches(String kind, Mat grayA, Mat grayB, Mat maskA, Mat maskB,
+                                               Mat frameA, Mat frameB, int camA, int camB,
+                                               List<PixelMatch> out) {
+        MatOfKeyPoint keysA = new MatOfKeyPoint();
+        MatOfKeyPoint keysB = new MatOfKeyPoint();
+        Mat descA = new Mat();
+        Mat descB = new Mat();
+        try {
+            if ("AKAZE".equals(kind)) {
+                AKAZE akaze = AKAZE.create();
+                akaze.detectAndCompute(grayA, maskA, keysA, descA);
+                akaze.detectAndCompute(grayB, maskB, keysB, descB);
+            } else {
+                ORB orb = ORB.create(2000);
+                orb.detectAndCompute(grayA, maskA, keysA, descA);
+                orb.detectAndCompute(grayB, maskB, keysB, descB);
+            }
+        } catch (Throwable t) {
+            keysA.release();
+            keysB.release();
+            descA.release();
+            descB.release();
+            return;
+        }
+        if (descA.empty() || descB.empty()) {
+            keysA.release();
+            keysB.release();
+            descA.release();
+            descB.release();
+            return;
+        }
+        DescriptorMatcher matcher = DescriptorMatcher.create(DescriptorMatcher.BRUTEFORCE_HAMMING);
+        List<MatOfDMatch> knn = new ArrayList<>();
+        matcher.knnMatch(descA, descB, knn, 2);
+        org.opencv.core.KeyPoint[] ka = keysA.toArray();
+        org.opencv.core.KeyPoint[] kb = keysB.toArray();
+        double[] ra = VideoStreamingServer.cameraToVehicle(
+                VideoStreamingServer.CAM_YAW_DEG[camA],
+                VideoStreamingServer.CAM_PITCH_DEG[camA],
+                VideoStreamingServer.CAM_ROLL_DEG[camA]);
+        double[] rb = VideoStreamingServer.cameraToVehicle(
+                VideoStreamingServer.CAM_YAW_DEG[camB],
+                VideoStreamingServer.CAM_PITCH_DEG[camB],
+                VideoStreamingServer.CAM_ROLL_DEG[camB]);
+        for (MatOfDMatch pair : knn) {
+            org.opencv.core.DMatch[] dm = pair.toArray();
+            if (dm.length < 2 || dm[0].distance > 0.75 * dm[1].distance) {
+                continue;
+            }
+            double ua = ka[dm[0].queryIdx].pt.x;
+            double va = ka[dm[0].queryIdx].pt.y;
+            double ub = kb[dm[0].trainIdx].pt.x;
+            double vb = kb[dm[0].trainIdx].pt.y;
+            double[] rayA = equidistantRay(frameA, ua, va);
+            double[] rayB = equidistantRay(frameB, ub, vb);
+            if (rayA == null || rayB == null) {
+                continue;
+            }
+            if (angleDeg(mul(ra, rayA), mul(rb, rayB)) > 45) {
+                continue;
+            }
+            if (alreadyHave(out, camA, camB, ua, va, ub, vb)) {
+                continue;
+            }
+            out.add(new PixelMatch(camA, camB, ua, va, ub, vb));
+        }
+        keysA.release();
+        keysB.release();
+        descA.release();
+        descB.release();
+    }
+
+    private static boolean alreadyHave(List<PixelMatch> out, int camA, int camB,
+                                       double ua, double va, double ub, double vb) {
+        for (PixelMatch m : out) {
+            if (m.a != camA || m.b != camB) {
+                continue;
+            }
+            if (Math.hypot(m.ua - ua, m.va - va) < 8 && Math.hypot(m.ub - ub, m.vb - vb) < 8) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static double[] equidistantRay(Mat frame, double u, double v) {
+        int w = frame.cols();
+        int h = frame.rows();
+        double f = VideoStreamingServer.fisheyeFocal(w, h, VideoStreamingServer.INPUT_FISHEYE_FOV_DEG);
+        return CalibrationManager.unprojectFisheye(
+                u, v, new double[] {f, f, w * 0.5, h * 0.5}, 0, 0, 0, 0);
+    }
+
+    /** Fit each camera's fisheye so a shared point becomes the same ray. */
+    private static boolean fitUndistortion(List<PixelMatch> matches, Fit[] lenses) {
+        double before = featureCost(matches, lenses);
+        System.out.printf(Locale.US, "  ray error before undistortion %.3f deg%n", before);
+        double[] fRef0 = new double[4];
+        int[] ww = new int[4];
+        int[] hh = new int[4];
+        for (int cam = 0; cam < 4; cam++) {
+            if (lenses[cam] == null || lenses[cam].f <= 0) {
+                continue;
+            }
+            fRef0[cam] = lenses[cam].f;
+            ww[cam] = (int) Math.round(lenses[cam].cx / Math.max(VideoStreamingServer.FISHEYE_CX, 0.1));
+            hh[cam] = (int) Math.round(lenses[cam].cy / Math.max(VideoStreamingServer.FISHEYE_CY, 0.1));
+        }
+        for (int pass = 0; pass < 2; pass++) {
+            for (int cam = 0; cam < 4; cam++) {
+                if (lenses[cam] == null || lenses[cam].f <= 0) {
+                    continue;
+                }
+                Fit base = lenses[cam];
+                double fRef = fRef0[cam];
+                int w = ww[cam];
+                int h = hh[cam];
+                double minSide = Math.min(w, h);
+                double[] start = {base.f, base.cx, base.cy, base.k1, base.k2};
+                double[] step = {base.f * 0.04, w * 0.01, h * 0.01, 0.02, 0.012};
+                final int camera = cam;
+                double[] best = nelderMead(start, step, 24, p -> {
+                    if (!lensParamsOk(p, w, h, minSide, fRef)) {
+                        return 1e6;
+                    }
+                    Fit trial = copyFit(lenses[camera]);
+                    trial.f = p[0];
+                    trial.cx = p[1];
+                    trial.cy = p[2];
+                    trial.k1 = p[3];
+                    trial.k2 = p[4];
+                    Fit[] tmp = lenses.clone();
+                    tmp[camera] = trial;
+                    return featureCost(matches, tmp);
+                });
+                if (lensParamsOk(best, w, h, minSide, fRef)) {
+                    base.f = best[0];
+                    base.cx = best[1];
+                    base.cy = best[2];
+                    base.k1 = best[3];
+                    base.k2 = best[4];
+                }
+            }
+        }
+        double after = featureCost(matches, lenses);
+        System.out.printf(Locale.US, "  ray error after undistortion %.3f deg%n", after);
+        boolean ok = after < before - 0.05 && Double.isFinite(after);
+        for (Fit lens : lenses) {
+            if (lens != null && lens.f > 0) {
+                lens.rmsDeg = after;
+                lens.accepted = ok;
+            }
+        }
+        return ok;
+    }
+
+    private static boolean lensParamsOk(double[] p, int w, int h, double minSide, double fRef) {
+        if (p[0] < fRef * 0.88 || p[0] > fRef * 1.12) {
+            return false;
+        }
+        if (p[1] < 0.45 * w || p[1] > 0.55 * w || p[2] < 0.45 * h || p[2] > 0.55 * h) {
+            return false;
+        }
+        if (Math.abs(p[3]) > 0.12 || Math.abs(p[4]) > 0.05) {
+            return false;
+        }
+        return !CalibrationManager.distortionFolds(p[3], p[4], 0, 0);
+    }
+
+    private static Fit copyFit(Fit src) {
+        Fit fit = new Fit();
+        fit.f = src.f;
+        fit.cx = src.cx;
+        fit.cy = src.cy;
+        fit.k1 = src.k1;
+        fit.k2 = src.k2;
+        fit.k3 = src.k3;
+        fit.k4 = src.k4;
+        fit.rmsDeg = src.rmsDeg;
+        fit.accepted = src.accepted;
+        return fit;
+    }
+
+    private static double featureCost(List<PixelMatch> matches, Fit[] lenses) {
+        double sum = 0;
+        int n = 0;
+        for (PixelMatch m : matches) {
+            if (lenses[m.a] == null || lenses[m.b] == null) {
+                continue;
+            }
+            double[] rayA = rayFromFit(lenses[m.a], m.ua, m.va);
+            double[] rayB = rayFromFit(lenses[m.b], m.ub, m.vb);
+            if (rayA == null || rayB == null) {
+                continue;
+            }
+            double[] ra = VideoStreamingServer.cameraToVehicle(
+                    VideoStreamingServer.CAM_YAW_DEG[m.a],
+                    VideoStreamingServer.CAM_PITCH_DEG[m.a],
+                    VideoStreamingServer.CAM_ROLL_DEG[m.a]);
+            double[] rb = VideoStreamingServer.cameraToVehicle(
+                    VideoStreamingServer.CAM_YAW_DEG[m.b],
+                    VideoStreamingServer.CAM_PITCH_DEG[m.b],
+                    VideoStreamingServer.CAM_ROLL_DEG[m.b]);
+            sum += Math.min(20.0, angleDeg(mul(ra, rayA), mul(rb, rayB)));
+            n++;
+        }
+        return n < 8 ? 1e6 : sum / n;
+    }
+
+    private static double[] rayFromFit(Fit fit, double u, double v) {
+        return CalibrationManager.unprojectFisheye(
+                u, v, new double[] {fit.f, fit.f, fit.cx, fit.cy}, fit.k1, fit.k2, 0, 0);
+    }
+
+    private static List<RayMatch> raysFromCommon(List<PixelMatch> common, Fit[] lenses) {
+        List<RayMatch> rays = new ArrayList<>();
+        for (PixelMatch m : common) {
+            if (lenses[m.a] == null || lenses[m.b] == null) {
+                continue;
+            }
+            double[] rayA = rayFromFit(lenses[m.a], m.ua, m.va);
+            double[] rayB = rayFromFit(lenses[m.b], m.ub, m.vb);
+            if (rayA == null || rayB == null) {
+                continue;
+            }
+            rays.add(new RayMatch(m.a, m.b, rayA, rayB));
+        }
+        return rays;
     }
 
     private static Fit fitCamera(List<Mat> frames, int w, int h) {
@@ -626,13 +975,14 @@ public final class LineFisheyeCalibrator {
         CalibrationManager.CameraModel model = CalibrationManager.load(VideoStreamingServer.CAM_ROLE[cam]);
         double f = VideoStreamingServer.fisheyeFocal(frame.cols(), frame.rows(),
                 VideoStreamingServer.INPUT_FISHEYE_FOV_DEG);
-        double[] k = (model != null && model.hasIntrinsics)
+        boolean use = CalibrationManager.stableIntrinsics(model);
+        double[] k = use
                 ? model.scaledK(frame.cols(), frame.rows())
                 : new double[] {f, f, frame.cols() * 0.5, frame.rows() * 0.5};
-        double k1 = model != null && model.hasIntrinsics ? model.k1 : 0;
-        double k2 = model != null && model.hasIntrinsics ? model.k2 : 0;
-        double k3 = model != null && model.hasIntrinsics ? model.k3 : 0;
-        double k4 = model != null && model.hasIntrinsics ? model.k4 : 0;
+        double k1 = use ? model.k1 : 0;
+        double k2 = use ? model.k2 : 0;
+        double k3 = use ? model.k3 : 0;
+        double k4 = use ? model.k4 : 0;
         return CalibrationManager.unprojectFisheye(u, v, k, k1, k2, k3, k4);
     }
 

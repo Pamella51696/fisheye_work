@@ -34,7 +34,7 @@ import org.opencv.videoio.Videoio;
  *
  * Main calibration uses the existing clips (no checkerboard):
  *   java VideoStreamingServer --calibrate
- *   straight lines → fisheye K,D → ORB → RANSAC → ground lines
+ *   common overlap features → fisheye K,D → RANSAC → ground lines
  * Checkerboard calibration is optional:
  *   java VideoStreamingServer --calibrate-chessboard [--pattern 9x6] [--square 30mm]
  * Production loads calib/&lt;role&gt;.json when present; otherwise the
