@@ -32,8 +32,11 @@ import org.opencv.videoio.Videoio;
  * Horizon is φ = 0 in the vehicle frame (pose), not an image-space shift.
  * Clips are discovered in the working folder (left / front / right / rear).
  *
- * Chessboard calibration is backend-only (no UI):
- *   java VideoStreamingServer --calibrate [--pattern 9x6] [--square 30mm]
+ * Main calibration uses the existing clips (no checkerboard):
+ *   java VideoStreamingServer --calibrate
+ *   straight lines → fisheye K,D → ORB → RANSAC → ground lines
+ * Checkerboard calibration is optional:
+ *   java VideoStreamingServer --calibrate-chessboard [--pattern 9x6] [--square 30mm]
  * Production loads calib/&lt;role&gt;.json when present; otherwise the
  * equidistant FOV model is used. Maps are built once, then remap() per frame.
  */
@@ -79,7 +82,15 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         }
         loadFfmpegPlugin();
 
-        if (CalibrationManager.isCalibrateArgs(args)) {
+        if (LineFisheyeCalibrator.isSelfTestArgs(args)) {
+            int code = LineFisheyeCalibrator.selfTest();
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
+        if (CalibrationManager.isChessboardCalibrateArgs(args)) {
             CalibrationManager.Options opt;
             try {
                 opt = CalibrationManager.parseArgs(args);
@@ -92,6 +103,21 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
                     ? opt.folder : Paths.get(".").toAbsolutePath().normalize();
             int align = alignMountPoseFromSeams(calibFolder);
             if (code != 0 && align != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
+        if (CalibrationManager.isCalibrateArgs(args)) {
+            CalibrationManager.Options opt;
+            try {
+                opt = CalibrationManager.parseArgs(args);
+            } catch (RuntimeException e) {
+                System.err.println(e.getMessage());
+                return;
+            }
+            int code = LineFisheyeCalibrator.run(opt.folder);
+            if (code != 0) {
                 System.exit(code);
             }
             return;
@@ -737,7 +763,7 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             Imgproc.remap(src, dst, map1, map2, Imgproc.INTER_LINEAR,
                     Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
         }
- 
+
         private void ensureMaps(int srcW, int srcH) {
             if (map1 != null && srcW == cachedSrcW && srcH == cachedSrcH) {
                 return;
@@ -828,6 +854,14 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             cachedSrcW = srcW;
             cachedSrcH = srcH;
         }
+    }
+
+    /** One spherical panel, used by the line-calibration projection stage. */
+    static Mat projectPanel(Mat src, int index) {
+        SphericalPanel panel = new SphericalPanel(index);
+        Mat dst = new Mat();
+        panel.project(src, dst);
+        return dst;
     }
  
     /**

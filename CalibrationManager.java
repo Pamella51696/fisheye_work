@@ -209,7 +209,7 @@ public final class CalibrationManager {
             return 1;
         }
 
-        System.out.println("CALIBRATION MODE");
+        System.out.println("CHESSBOARD CALIBRATION (secondary)");
         System.out.println("Pattern: " + opt.patternCols + " × " + opt.patternRows
                 + " inner corners");
         System.out.println("Square size: " + (opt.squareMeters * 1000.0) + " mm");
@@ -1232,6 +1232,18 @@ public final class CalibrationManager {
         }
         for (String a : args) {
             if ("--align-mounts".equals(a)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static boolean isChessboardCalibrateArgs(String[] args) {
+        if (args == null) {
+            return false;
+        }
+        for (String a : args) {
+            if ("--calibrate-chessboard".equals(a)) {
                 return true;
             }
         }
