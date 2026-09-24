@@ -143,7 +143,7 @@ public final class CalibrationManager {
         double yaw = VideoStreamingServer.CAM_YAW_DEG[camIndex];
         double pitch = VideoStreamingServer.CAM_PITCH_DEG[camIndex];
         double roll = VideoStreamingServer.CAM_ROLL_DEG[camIndex];
-        if (calib != null && calib.hasExtrinsics) {
+        if (stableExtrinsics(camIndex, calib)) {
             yaw = calib.yawDeg;
             pitch = calib.pitchDeg;
             roll = calib.rollDeg;
@@ -155,6 +155,60 @@ public final class CalibrationManager {
             roll = rollOverride;
         }
         return new double[] { yaw, pitch, roll };
+    }
+
+    /** True when K,D stay near the equidistant fisheye and do not fold the image. */
+    static boolean stableIntrinsics(CameraModel m) {
+        if (m == null || !m.hasIntrinsics || m.imageWidth < 16 || m.imageHeight < 16) {
+            return false;
+        }
+        if (m.fx <= 1 || m.fy <= 1) {
+            return false;
+        }
+        double f0 = VideoStreamingServer.fisheyeFocal(
+                m.imageWidth, m.imageHeight, VideoStreamingServer.INPUT_FISHEYE_FOV_DEG);
+        if (m.fx < 0.82 * f0 || m.fx > 1.22 * f0 || m.fy < 0.82 * f0 || m.fy > 1.22 * f0) {
+            return false;
+        }
+        if (m.cx < 0.42 * m.imageWidth || m.cx > 0.58 * m.imageWidth
+                || m.cy < 0.42 * m.imageHeight || m.cy > 0.58 * m.imageHeight) {
+            return false;
+        }
+        if (Math.abs(m.k1) > 0.15 || Math.abs(m.k2) > 0.08
+                || Math.abs(m.k3) > 0.04 || Math.abs(m.k4) > 0.04) {
+            return false;
+        }
+        return !distortionFolds(m.k1, m.k2, m.k3, m.k4);
+    }
+
+    static boolean stableExtrinsics(int camIndex, CameraModel m) {
+        if (m == null || !m.hasExtrinsics) {
+            return false;
+        }
+        double yawDelta = m.yawDeg - VideoStreamingServer.CAM_YAW_DEG[camIndex];
+        while (yawDelta > 180) {
+            yawDelta -= 360;
+        }
+        while (yawDelta < -180) {
+            yawDelta += 360;
+        }
+        return Math.abs(yawDelta) <= 10
+                && Math.abs(m.pitchDeg - VideoStreamingServer.CAM_PITCH_DEG[camIndex]) <= 8
+                && Math.abs(m.rollDeg - VideoStreamingServer.CAM_ROLL_DEG[camIndex]) <= 6;
+    }
+
+    static boolean distortionFolds(double k1, double k2, double k3, double k4) {
+        for (double theta = 0.1; theta <= 1.35; theta += 0.05) {
+            double t2 = theta * theta;
+            double t4 = t2 * t2;
+            double t6 = t4 * t2;
+            double t8 = t4 * t4;
+            double deriv = 1.0 + 3.0 * k1 * t2 + 5.0 * k2 * t4 + 7.0 * k3 * t6 + 9.0 * k4 * t8;
+            if (deriv < 0.25) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static boolean saveMountPose(String role, double yawDeg, double pitchDeg,
@@ -385,6 +439,10 @@ public final class CalibrationManager {
         double t6 = t4 * t2;
         double t8 = t4 * t4;
         double thetaD = theta * (1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8);
+        double deriv = 1.0 + 3.0 * k1 * t2 + 5.0 * k2 * t4 + 7.0 * k3 * t6 + 9.0 * k4 * t8;
+        if (deriv < 0.25 || thetaD < 0) {
+            return null;
+        }
         double scale = r > 1e-12 ? thetaD / r : 1.0;
         double xd = xn * scale;
         double yd = yn * scale;

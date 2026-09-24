@@ -141,6 +141,12 @@ public final class LineFisheyeCalibrator {
             optimizeGroundLines(chains, preview, yaw, pitch, roll);
             System.out.println("final calibration");
             for (int i = 0; i < 4; i++) {
+                yaw[i] = clamp(yaw[i], VideoStreamingServer.CAM_YAW_DEG[i] - 10,
+                        VideoStreamingServer.CAM_YAW_DEG[i] + 10);
+                pitch[i] = clamp(pitch[i], VideoStreamingServer.CAM_PITCH_DEG[i] - 8,
+                        VideoStreamingServer.CAM_PITCH_DEG[i] + 8);
+                roll[i] = clamp(roll[i], VideoStreamingServer.CAM_ROLL_DEG[i] - 6,
+                        VideoStreamingServer.CAM_ROLL_DEG[i] + 6);
                 if (!wrote[i]) {
                     continue;
                 }
@@ -220,52 +226,58 @@ public final class LineFisheyeCalibrator {
 
         System.out.println("straight-line calibration");
         System.out.println("fit fisheye model");
+        final double fRef = fit.f;
         double initCost = lineCost(fit.chains, fit.f, fit.cx, fit.cy, 0, 0, 0, 0, minSide);
         double[] best = {fit.f, fit.cx, fit.cy, 0, 0, 0, 0};
         double bestCost = initCost;
-        double[] k1Seeds = {0, 0.08, -0.08, 0.15};
+        double[] k1Seeds = {0, 0.05, -0.05};
         for (double k1 : k1Seeds) {
             double[] start = {fit.f, fit.cx, fit.cy, k1, 0, 0, 0};
-            double[] step = {fit.f * 0.06, w * 0.015, h * 0.015, 0.03, 0.03, 0.015, 0.015};
-            double[] got = nelderMead(start, step, 28, p -> evalParams(p, fit.chains, w, h, minSide));
-            double c = evalParams(got, fit.chains, w, h, minSide);
+            double[] step = {fit.f * 0.04, w * 0.01, h * 0.01, 0.02, 0.015, 0, 0};
+            double[] got = nelderMead(start, step, 28,
+                    p -> evalParams(p, fit.chains, w, h, minSide, fRef));
+            double c = evalParams(got, fit.chains, w, h, minSide, fRef);
             if (c < bestCost) {
                 bestCost = c;
                 best = got;
             }
         }
-        double[] step = {best[0] * 0.04, w * 0.01, h * 0.01, 0.02, 0.02, 0.01, 0.01};
-        best = nelderMead(best, step, 50, p -> evalParams(p, fit.chains, w, h, minSide));
-        bestCost = evalParams(best, fit.chains, w, h, minSide);
+        double[] step = {best[0] * 0.025, w * 0.008, h * 0.008, 0.012, 0.01, 0, 0};
+        best = nelderMead(best, step, 40, p -> evalParams(p, fit.chains, w, h, minSide, fRef));
+        bestCost = evalParams(best, fit.chains, w, h, minSide, fRef);
         fit.f = best[0];
         fit.cx = best[1];
         fit.cy = best[2];
         fit.k1 = best[3];
         fit.k2 = best[4];
-        fit.k3 = best[5];
-        fit.k4 = best[6];
+        fit.k3 = 0;
+        fit.k4 = 0;
         fit.rmsDeg = Math.toDegrees(Math.sqrt(Math.max(0, bestCost)));
-        fit.accepted = bestCost < initCost * 0.97 && Double.isFinite(bestCost);
+        fit.accepted = bestCost < initCost * 0.97 && Double.isFinite(bestCost)
+                && !CalibrationManager.distortionFolds(fit.k1, fit.k2, 0, 0);
         System.out.printf(Locale.US, "  plane error init %.5f → fit %.5f%n", initCost, bestCost);
         return fit;
     }
 
-    private static double evalParams(double[] p, List<Chain> chains, int w, int h, double minSide) {
+    private static double evalParams(double[] p, List<Chain> chains, int w, int h,
+                                     double minSide, double fRef) {
         double f = p[0];
         double cx = p[1];
         double cy = p[2];
-        if (f < 0.18 * minSide || f > 0.85 * minSide) {
+        if (f < fRef * 0.88 || f > fRef * 1.12) {
             return 1e6;
         }
-        if (cx < 0.35 * w || cx > 0.65 * w || cy < 0.35 * h || cy > 0.65 * h) {
+        if (cx < 0.45 * w || cx > 0.55 * w || cy < 0.45 * h || cy > 0.55 * h) {
             return 1e6;
         }
-        for (int i = 3; i < 7; i++) {
-            if (Math.abs(p[i]) > 0.7) {
-                return 1e6;
-            }
+        if (Math.abs(p[3]) > 0.12 || Math.abs(p[4]) > 0.05
+                || Math.abs(p[5]) > 1e-6 || Math.abs(p[6]) > 1e-6) {
+            return 1e6;
         }
-        return lineCost(chains, f, cx, cy, p[3], p[4], p[5], p[6], minSide);
+        if (CalibrationManager.distortionFolds(p[3], p[4], 0, 0)) {
+            return 1e6;
+        }
+        return lineCost(chains, f, cx, cy, p[3], p[4], 0, 0, minSide);
     }
 
     /** Mean squared distance of unprojected rays from a plane through the origin. */
@@ -663,8 +675,9 @@ public final class LineFisheyeCalibrator {
                     continue;
                 }
                 double[] euler = eulerFromRotation(r);
-                if (Math.abs(euler[0] - VideoStreamingServer.CAM_YAW_DEG[moving]) > 35
-                        || Math.abs(euler[1] - VideoStreamingServer.CAM_PITCH_DEG[moving]) > 30) {
+                if (Math.abs(euler[0] - VideoStreamingServer.CAM_YAW_DEG[moving]) > 10
+                        || Math.abs(euler[1] - VideoStreamingServer.CAM_PITCH_DEG[moving]) > 8
+                        || Math.abs(euler[2] - VideoStreamingServer.CAM_ROLL_DEG[moving]) > 6) {
                     continue;
                 }
                 int inliers = countInliers(subset, moving, rAnchor, r, 3.0);
@@ -922,6 +935,10 @@ public final class LineFisheyeCalibrator {
                 Math.toDegrees(-beta),
                 Math.toDegrees(roll)
         };
+    }
+
+    private static double clamp(double v, double lo, double hi) {
+        return Math.max(lo, Math.min(hi, v));
     }
 
     private static double[] mul(double[] r, double[] v) {

@@ -72,6 +72,7 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
     static final double[] CAM_PITCH_DEG = { -14.0, -12.0, -14.0, -21.0 };
     static final double[] CAM_ROLL_DEG  = {  0.0,  0.0,  0.0,   0.0 };
     static final String[] CAM_ROLE      = { "left", "front", "right", "rear" };
+    private static final boolean[] UNSTABLE_INTRINSICS_WARNED = new boolean[4];
  
     public static void main(String[] args) throws IOException {
         try {
@@ -768,7 +769,13 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             if (map1 != null && srcW == cachedSrcW && srcH == cachedSrcH) {
                 return;
             }
-            boolean useCalib = calib != null && calib.hasIntrinsics;
+            boolean useCalib = CalibrationManager.stableIntrinsics(calib);
+            if (calib != null && calib.hasIntrinsics && !useCalib
+                    && !UNSTABLE_INTRINSICS_WARNED[index]) {
+                UNSTABLE_INTRINSICS_WARNED[index] = true;
+                System.out.println("  calib " + CAM_ROLE[index]
+                        + ": distortion would warp the image, using equidistant lens");
+            }
             double f = fisheyeFocal(srcW, srcH, INPUT_FISHEYE_FOV_DEG);
             double[] K = useCalib
                     ? calib.scaledK(srcW, srcH)
@@ -1043,22 +1050,43 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         if (overlap <= 0) {
             return mask;
         }
+        int feather = Math.min(36, overlap);
+        int center0 = Math.max(0, (overlap - feather) / 2);
         for (int x = 0; x < overlap; x++) {
-            double cosine = 0.5 - 0.5 * Math.cos(Math.PI * x / overlap);
             if (fadeLeft) {
-                float alpha = (float) Math.pow(cosine, inExp);
+                float alpha = seamWeight(x, center0, feather, true, inExp);
                 Mat colL = mask.col(x);
                 colL.setTo(new Scalar(alpha));
                 colL.release();
             }
             if (fadeRight) {
-                float alpha = (float) Math.pow(cosine, outExp);
+                int offset = overlap - 1 - x;
+                float alpha = seamWeight(offset, center0, feather, false, outExp);
                 Mat colR = mask.col(W - 1 - x);
                 colR.setTo(new Scalar(alpha));
                 colR.release();
             }
         }
         return mask;
+    }
+
+    /** One camera owns each side of a wide overlap; only the center band mixes. */
+    private static float seamWeight(int offset, int center0, int feather,
+                                    boolean fadeIn, double exp) {
+        double w;
+        if (offset < center0) {
+            w = fadeIn ? 0 : 1;
+        } else if (offset >= center0 + feather) {
+            w = fadeIn ? 1 : 0;
+        } else {
+            double t = (offset - center0) / (double) feather;
+            double cosine = 0.5 - 0.5 * Math.cos(Math.PI * t);
+            w = fadeIn ? cosine : 1.0 - cosine;
+        }
+        if (exp > 0 && exp != 1.0 && w > 0 && w < 1) {
+            w = fadeIn ? Math.pow(w, exp) : 1.0 - Math.pow(1.0 - w, exp);
+        }
+        return (float) w;
     }
  
         static Mat edgeDistanceWeight(Mat bgr, int radius) {
