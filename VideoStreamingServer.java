@@ -861,14 +861,99 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             cachedSrcW = srcW;
             cachedSrcH = srcH;
         }
+
+        double[] sourceAt(double pu, double pv, int srcW, int srcH) {
+            boolean useCalib = CalibrationManager.stableIntrinsics(calib);
+            double f = fisheyeFocal(srcW, srcH, INPUT_FISHEYE_FOV_DEG);
+            double[] k = useCalib
+                    ? calib.scaledK(srcW, srcH)
+                    : new double[] { f, f, srcW * FISHEYE_CX, srcH * FISHEYE_CY };
+            double k1 = useCalib ? calib.k1 : 0;
+            double k2 = useCalib ? calib.k2 : 0;
+            double k3 = useCalib ? calib.k3 : 0;
+            double k4 = useCalib ? calib.k4 : 0;
+            int u = (int) Math.round(pu);
+            int v = (int) Math.round(pv);
+            if (u < 0 || v < 0 || u >= PANEL_WIDTH || v >= PANEL_HEIGHT) {
+                return null;
+            }
+            double yaw0 = Math.toRadians(CAM_YAW_DEG[index]);
+            double yawSpan = Math.toRadians(PANEL_YAW_DEG);
+            double pitchSpan = Math.toRadians(PANEL_PITCH_DEG);
+            double horizonY = HORIZON_FRACTION * PANEL_HEIGHT;
+            double phi = (horizonY - v) / PANEL_HEIGHT * pitchSpan;
+            double theta = yaw0 + ((u + 0.5) / PANEL_WIDTH - 0.5) * yawSpan;
+            double xv = Math.cos(phi) * Math.cos(theta);
+            double yv = Math.cos(phi) * Math.sin(theta);
+            double zv = Math.sin(phi);
+            double xc = R[0] * xv + R[3] * yv + R[6] * zv;
+            double yc = R[1] * xv + R[4] * yv + R[7] * zv;
+            double zc = R[2] * xv + R[5] * yv + R[8] * zv;
+            if (zc <= 1e-4) {
+                return null;
+            }
+            float su;
+            float sv;
+            if (useCalib) {
+                float[] uv = CalibrationManager.projectFisheye(xc, yc, zc, k, k1, k2, k3, k4);
+                if (uv == null) {
+                    return null;
+                }
+                su = uv[0];
+                sv = uv[1];
+            } else {
+                double inc = Math.atan2(Math.hypot(xc, yc), zc);
+                double radius = fisheyeRadius(inc, f);
+                double az = Math.atan2(yc, xc);
+                su = (float) (k[2] + radius * Math.cos(az));
+                sv = (float) (k[3] + radius * Math.sin(az));
+            }
+            if (su < 1 || sv < 1 || su >= srcW - 1 || sv >= srcH - 1) {
+                return null;
+            }
+            return new double[] { su, sv };
+        }
     }
 
     /** One spherical panel, used by the line-calibration projection stage. */
     static Mat projectPanel(Mat src, int index) {
-        SphericalPanel panel = new SphericalPanel(index);
+        return projectPanel(src, index, Double.NaN, Double.NaN, Double.NaN);
+    }
+
+    static Mat projectPanel(Mat src, int index, double yaw, double pitch, double roll) {
+        SphericalPanel panel = new SphericalPanel(index, yaw, pitch, roll);
         Mat dst = new Mat();
         panel.project(src, dst);
         return dst;
+    }
+
+    /** Fisheye pixel sampled by one spherical-panel pixel at the given mount pose. */
+    static double[] sourcePixel(int index, double pu, double pv, int srcW, int srcH,
+                                double yaw, double pitch, double roll) {
+        SphericalPanel panel = new SphericalPanel(index, yaw, pitch, roll);
+        return panel.sourceAt(pu, pv, srcW, srcH);
+    }
+
+    /** Panorama location of a camera-frame ray. X is continuous across the four panels. */
+    static double[] panoramaXY(int cam, double[] camRay, double yaw, double pitch, double roll) {
+        double[] r = cameraToVehicle(yaw, pitch, roll);
+        double xv = r[0] * camRay[0] + r[1] * camRay[1] + r[2] * camRay[2];
+        double yv = r[3] * camRay[0] + r[4] * camRay[1] + r[5] * camRay[2];
+        double zv = r[6] * camRay[0] + r[7] * camRay[1] + r[8] * camRay[2];
+        double theta = Math.atan2(yv, xv);
+        double yaw0 = Math.toRadians(CAM_YAW_DEG[cam]);
+        while (theta - yaw0 > Math.PI) {
+            theta -= 2 * Math.PI;
+        }
+        while (yaw0 - theta > Math.PI) {
+            theta += 2 * Math.PI;
+        }
+        double yawSpan = Math.toRadians(PANEL_YAW_DEG);
+        double u = ((theta - yaw0) / yawSpan + 0.5) * PANEL_WIDTH;
+        double phi = Math.atan2(zv, Math.hypot(xv, yv));
+        double row = HORIZON_FRACTION * PANEL_HEIGHT - phi / Math.toRadians(PANEL_PITCH_DEG) * PANEL_HEIGHT;
+        double x = cam * (PANEL_WIDTH - panelOverlapPx()) + u;
+        return new double[] { x, row };
     }
  
     /**

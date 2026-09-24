@@ -1,4 +1,5 @@
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
@@ -27,6 +28,7 @@ import org.opencv.videoio.Videoio;
  *     → undistortion (K,D) from those shared points
  *     → straight-line fit only if the overlap has too few points
  *     → projection, RANSAC, ground lines
+ *     → shared objects on the projected overlap (front–right and the other seams)
  *
  * Checkerboard calibration stays available as {@code --calibrate-chessboard}.
  */
@@ -161,42 +163,50 @@ public final class LineFisheyeCalibrator {
         System.out.println("feature rays for extrinsics");
         List<RayMatch> matches = raysFromCommon(common, lenses);
         System.out.println("  matches: " + matches.size());
+        double[] yaw = new double[4];
+        double[] pitch = new double[4];
+        double[] roll = new double[4];
+        for (int i = 0; i < 4; i++) {
+            CalibrationManager.CameraModel m = CalibrationManager.load(VideoStreamingServer.CAM_ROLE[i]);
+            double[] pose = CalibrationManager.mountDegreesForStitch(i, m, Double.NaN, Double.NaN);
+            yaw[i] = pose[0];
+            pitch[i] = pose[1];
+            roll[i] = pose[2];
+        }
         if (matches.size() >= 12) {
-            double[] yaw = new double[4];
-            double[] pitch = new double[4];
-            double[] roll = new double[4];
-            for (int i = 0; i < 4; i++) {
-                CalibrationManager.CameraModel m = CalibrationManager.load(VideoStreamingServer.CAM_ROLE[i]);
-                double[] pose = CalibrationManager.mountDegreesForStitch(i, m, Double.NaN, Double.NaN);
-                yaw[i] = pose[0];
-                pitch[i] = pose[1];
-                roll[i] = pose[2];
-            }
             System.out.println("RANSAC");
             ransacExtrinsics(matches, yaw, pitch, roll);
             System.out.println("extrinsic refinement");
             refineExtrinsics(matches, yaw, pitch, roll);
-            System.out.println("ground-line optimization");
-            optimizeGroundLines(chains, preview, yaw, pitch, roll);
-            System.out.println("final calibration");
-            for (int i = 0; i < 4; i++) {
-                yaw[i] = clamp(yaw[i], VideoStreamingServer.CAM_YAW_DEG[i] - 10,
-                        VideoStreamingServer.CAM_YAW_DEG[i] + 10);
-                pitch[i] = clamp(pitch[i], VideoStreamingServer.CAM_PITCH_DEG[i] - 8,
-                        VideoStreamingServer.CAM_PITCH_DEG[i] + 8);
-                roll[i] = clamp(roll[i], VideoStreamingServer.CAM_ROLL_DEG[i] - 6,
-                        VideoStreamingServer.CAM_ROLL_DEG[i] + 6);
-                if (!wrote[i]) {
-                    continue;
-                }
-                CalibrationManager.saveMountPose(
-                        VideoStreamingServer.CAM_ROLE[i], yaw[i], pitch[i], roll[i]);
-                System.out.printf(Locale.US, "  %s yaw=%.2f pitch=%.2f roll=%.2f%n",
-                        VideoStreamingServer.CAM_ROLE[i], yaw[i], pitch[i], roll[i]);
-            }
         } else {
-            System.err.println("Not enough overlap matches for extrinsics.");
-            System.err.println("Intrinsics were still saved when the line fit succeeded.");
+            System.out.println("Not enough raw overlap matches for RANSAC.");
+            System.out.println("Aligning the projected frames directly.");
+        }
+        System.out.println("ground-line optimization");
+        optimizeGroundLines(chains, preview, yaw, pitch, roll);
+        System.out.println("shared-object alignment (front–right and the other seams)");
+        alignSharedObjects(preview, extra, yaw, pitch, roll);
+        System.out.println("final calibration");
+        for (int i = 0; i < 4; i++) {
+            yaw[i] = clamp(yaw[i], VideoStreamingServer.CAM_YAW_DEG[i] - 15,
+                    VideoStreamingServer.CAM_YAW_DEG[i] + 15);
+            pitch[i] = clamp(pitch[i], VideoStreamingServer.CAM_PITCH_DEG[i] - 8,
+                    VideoStreamingServer.CAM_PITCH_DEG[i] + 8);
+            roll[i] = clamp(roll[i], VideoStreamingServer.CAM_ROLL_DEG[i] - 6,
+                    VideoStreamingServer.CAM_ROLL_DEG[i] + 6);
+            if (!wrote[i]) {
+                wrote[i] = saveEquidistant(i, preview[i]);
+                if (wrote[i]) {
+                    saved++;
+                }
+            }
+            if (!wrote[i]) {
+                continue;
+            }
+            CalibrationManager.saveMountPose(
+                    VideoStreamingServer.CAM_ROLE[i], yaw[i], pitch[i], roll[i]);
+            System.out.printf(Locale.US, "  %s yaw=%.2f pitch=%.2f roll=%.2f%n",
+                    VideoStreamingServer.CAM_ROLE[i], yaw[i], pitch[i], roll[i]);
         }
 
         for (int i = 0; i < 4; i++) {
@@ -1025,7 +1035,7 @@ public final class LineFisheyeCalibrator {
                     continue;
                 }
                 double[] euler = eulerFromRotation(r);
-                if (Math.abs(euler[0] - VideoStreamingServer.CAM_YAW_DEG[moving]) > 10
+                if (Math.abs(euler[0] - VideoStreamingServer.CAM_YAW_DEG[moving]) > 15
                         || Math.abs(euler[1] - VideoStreamingServer.CAM_PITCH_DEG[moving]) > 8
                         || Math.abs(euler[2] - VideoStreamingServer.CAM_ROLL_DEG[moving]) > 6) {
                     continue;
@@ -1121,6 +1131,335 @@ public final class LineFisheyeCalibrator {
             before = best;
         }
         System.out.printf(Locale.US, "  refined ray error %.3f deg%n", before);
+    }
+
+    /**
+     * Match objects after both cameras are projected into the panorama, then
+     * slide the moving camera so those objects land on the same pixels.
+     * Front stays the yaw reference. The right camera is what moves for the
+     * front–right seam (the grey car shared by those two feeds).
+     */
+    private static void alignSharedObjects(Mat[] preview, Mat[] extra,
+                                           double[] yaw, double[] pitch, double[] roll) {
+        // camA, camB, moving. Front (1) is never the moving camera.
+        int[][] pairs = { {0, 1, 0}, {1, 2, 2}, {2, 3, 3} };
+        for (int[] pair : pairs) {
+            alignPair(preview, extra, pair[0], pair[1], pair[2], yaw, pitch, roll);
+        }
+    }
+
+    private static void alignPair(Mat[] primary, Mat[] extra, int camA, int camB, int moving,
+                                  double[] yaw, double[] pitch, double[] roll) {
+        String label = VideoStreamingServer.CAM_ROLE[camA] + "–" + VideoStreamingServer.CAM_ROLE[camB];
+        List<PanelTie> ties = tiesFrom(primary, camA, camB, yaw, pitch, roll);
+        if (ties.size() < 8) {
+            List<PanelTie> more = tiesFrom(extra, camA, camB, yaw, pitch, roll);
+            if (more.size() > ties.size()) {
+                ties = more;
+            }
+        }
+        if (ties.size() < 8) {
+            System.out.println("  " + label + ": " + ties.size()
+                    + " projected matches, need 8 (shared object not matched)");
+            return;
+        }
+        double before = panelOffset(ties, yaw, pitch, roll);
+        double baseY = yaw[moving];
+        double baseP = pitch[moving];
+        double baseR = roll[moving];
+        double best = before;
+        double by = baseY;
+        double bp = baseP;
+        double br = baseR;
+        double[] yawStep = {2.0, 0.5};
+        double[] pitchStep = {2.0, 0.5};
+        double[] rollStep = {2.0, 0.5};
+        double[] yawRange = {14.0, 2.0};
+        double[] pitchRange = {6.0, 2.0};
+        double[] rollRange = {4.0, 2.0};
+        for (int pass = 0; pass < 2; pass++) {
+            double y0 = by;
+            double p0 = bp;
+            double r0 = br;
+            for (double dy = -yawRange[pass]; dy <= yawRange[pass] + 1e-6; dy += yawStep[pass]) {
+                for (double dp = -pitchRange[pass]; dp <= pitchRange[pass] + 1e-6; dp += pitchStep[pass]) {
+                    for (double dr = -rollRange[pass]; dr <= rollRange[pass] + 1e-6; dr += rollStep[pass]) {
+                        yaw[moving] = y0 + dy;
+                        pitch[moving] = p0 + dp;
+                        roll[moving] = r0 + dr;
+                        double score = panelOffset(ties, yaw, pitch, roll);
+                        if (score < best) {
+                            best = score;
+                            by = yaw[moving];
+                            bp = pitch[moving];
+                            br = roll[moving];
+                        }
+                    }
+                }
+            }
+            yaw[moving] = by;
+            pitch[moving] = bp;
+            roll[moving] = br;
+        }
+        if (best > before - 1.0) {
+            yaw[moving] = baseY;
+            pitch[moving] = baseP;
+            roll[moving] = baseR;
+            System.out.printf(Locale.US,
+                    "  %s  %d shared points  offset %.1f px unchanged%n",
+                    label, ties.size(), before);
+            return;
+        }
+        System.out.printf(Locale.US,
+                "  %s  %d shared points  offset %.1f → %.1f px  yaw %.2f → %.2f  pitch %.2f  roll %.2f%n",
+                label, ties.size(), before, best, baseY, by, bp, br);
+    }
+
+    private static List<PanelTie> tiesFrom(Mat[] frames, int camA, int camB,
+                                           double[] yaw, double[] pitch, double[] roll) {
+        List<PanelTie> ties = new ArrayList<>();
+        if (frames == null || frames[camA] == null || frames[camB] == null
+                || frames[camA].empty() || frames[camB].empty()) {
+            return ties;
+        }
+        Mat panelA = VideoStreamingServer.projectPanel(
+                frames[camA], camA, yaw[camA], pitch[camA], roll[camA]);
+        Mat panelB = VideoStreamingServer.projectPanel(
+                frames[camB], camB, yaw[camB], pitch[camB], roll[camB]);
+        if (panelA.empty() || panelB.empty()) {
+            panelA.release();
+            panelB.release();
+            return ties;
+        }
+        int wide = Math.max(panelA.cols() / 3, VideoStreamingServer.panelOverlapPx());
+        int[] bands = { VideoStreamingServer.panelOverlapPx(), wide, panelA.cols() / 2 };
+        for (int band : bands) {
+            ties.clear();
+            collectPanelTies(panelA, panelB, frames[camA], frames[camB],
+                    camA, camB, band, yaw, pitch, roll, ties);
+            if (ties.size() >= 8) {
+                break;
+            }
+        }
+        panelA.release();
+        panelB.release();
+        return ties;
+    }
+
+    private static void collectPanelTies(Mat panelA, Mat panelB, Mat frameA, Mat frameB,
+                                         int camA, int camB, int band,
+                                         double[] yaw, double[] pitch, double[] roll,
+                                         List<PanelTie> ties) {
+        Mat grayA = new Mat();
+        Mat grayB = new Mat();
+        Imgproc.cvtColor(panelA, grayA, Imgproc.COLOR_BGR2GRAY);
+        Imgproc.cvtColor(panelB, grayB, Imgproc.COLOR_BGR2GRAY);
+        Mat maskA = bandMask(grayA.rows(), grayA.cols(), band, true);
+        Mat maskB = bandMask(grayB.rows(), grayB.cols(), band, false);
+        collectOneDetector("AKAZE", grayA, grayB, maskA, maskB, frameA, frameB,
+                camA, camB, yaw, pitch, roll, ties);
+        collectOneDetector("ORB", grayA, grayB, maskA, maskB, frameA, frameB,
+                camA, camB, yaw, pitch, roll, ties);
+        grayA.release();
+        grayB.release();
+        maskA.release();
+        maskB.release();
+    }
+
+    private static Mat bandMask(int h, int w, int band, boolean rightSide) {
+        Mat mask = Mat.zeros(h, w, CvType.CV_8UC1);
+        int width = Math.max(8, Math.min(band, w - 1));
+        int x0 = rightSide ? w - width : 0;
+        int x1 = rightSide ? w - 1 : width;
+        Imgproc.rectangle(mask, new Point(x0, 0), new Point(x1, h - 1),
+                new Scalar(255), Imgproc.FILLED);
+        return mask;
+    }
+
+    private static void collectOneDetector(String kind, Mat grayA, Mat grayB, Mat maskA, Mat maskB,
+                                           Mat frameA, Mat frameB, int camA, int camB,
+                                           double[] yaw, double[] pitch, double[] roll,
+                                           List<PanelTie> ties) {
+        MatOfKeyPoint keysA = new MatOfKeyPoint();
+        MatOfKeyPoint keysB = new MatOfKeyPoint();
+        Mat descA = new Mat();
+        Mat descB = new Mat();
+        try {
+            if ("AKAZE".equals(kind)) {
+                AKAZE akaze = AKAZE.create();
+                akaze.detectAndCompute(grayA, maskA, keysA, descA);
+                akaze.detectAndCompute(grayB, maskB, keysB, descB);
+            } else {
+                ORB orb = ORB.create(2500);
+                orb.detectAndCompute(grayA, maskA, keysA, descA);
+                orb.detectAndCompute(grayB, maskB, keysB, descB);
+            }
+        } catch (Throwable t) {
+            keysA.release();
+            keysB.release();
+            descA.release();
+            descB.release();
+            return;
+        }
+        if (descA.empty() || descB.empty()) {
+            keysA.release();
+            keysB.release();
+            descA.release();
+            descB.release();
+            return;
+        }
+        DescriptorMatcher matcher = DescriptorMatcher.create(DescriptorMatcher.BRUTEFORCE_HAMMING);
+        List<MatOfDMatch> knn = new ArrayList<>();
+        matcher.knnMatch(descA, descB, knn, 2);
+        org.opencv.core.KeyPoint[] ka = keysA.toArray();
+        org.opencv.core.KeyPoint[] kb = keysB.toArray();
+        for (MatOfDMatch pair : knn) {
+            org.opencv.core.DMatch[] dm = pair.toArray();
+            if (dm.length < 2 || dm[0].distance > 0.75 * dm[1].distance) {
+                continue;
+            }
+            double ua = ka[dm[0].queryIdx].pt.x;
+            double va = ka[dm[0].queryIdx].pt.y;
+            double ub = kb[dm[0].trainIdx].pt.x;
+            double vb = kb[dm[0].trainIdx].pt.y;
+            if (Math.abs(va - vb) > 140) {
+                continue;
+            }
+            if (tieExists(ties, ua, va, ub, vb)) {
+                continue;
+            }
+            double[] srcA = VideoStreamingServer.sourcePixel(
+                    camA, ua, va, frameA.cols(), frameA.rows(),
+                    yaw[camA], pitch[camA], roll[camA]);
+            double[] srcB = VideoStreamingServer.sourcePixel(
+                    camB, ub, vb, frameB.cols(), frameB.rows(),
+                    yaw[camB], pitch[camB], roll[camB]);
+            if (srcA == null || srcB == null) {
+                continue;
+            }
+            double[] rayA = stitchRay(camA, frameA, srcA[0], srcA[1]);
+            double[] rayB = stitchRay(camB, frameB, srcB[0], srcB[1]);
+            if (rayA == null || rayB == null) {
+                continue;
+            }
+            ties.add(new PanelTie(camA, camB, ua, va, ub, vb, rayA, rayB));
+        }
+        keysA.release();
+        keysB.release();
+        descA.release();
+        descB.release();
+    }
+
+    private static boolean tieExists(List<PanelTie> ties, double ua, double va, double ub, double vb) {
+        for (PanelTie t : ties) {
+            if (Math.hypot(t.ua - ua, t.va - va) < 6 && Math.hypot(t.ub - ub, t.vb - vb) < 6) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Pixel → camera ray with the same lens the stitch uses. */
+    private static double[] stitchRay(int cam, Mat frame, double u, double v) {
+        CalibrationManager.CameraModel model =
+                CalibrationManager.load(VideoStreamingServer.CAM_ROLE[cam]);
+        int w = frame.cols();
+        int h = frame.rows();
+        double f = VideoStreamingServer.fisheyeFocal(
+                w, h, VideoStreamingServer.INPUT_FISHEYE_FOV_DEG);
+        boolean use = CalibrationManager.stableIntrinsics(model);
+        double[] k = use
+                ? model.scaledK(w, h)
+                : new double[] {
+                    f, f,
+                    w * VideoStreamingServer.FISHEYE_CX,
+                    h * VideoStreamingServer.FISHEYE_CY };
+        double k1 = use ? model.k1 : 0;
+        double k2 = use ? model.k2 : 0;
+        double k3 = use ? model.k3 : 0;
+        double k4 = use ? model.k4 : 0;
+        return CalibrationManager.unprojectFisheye(u, v, k, k1, k2, k3, k4);
+    }
+
+    /** Mean panorama distance of the closest 70% of shared points, in pixels. */
+    private static double panelOffset(List<PanelTie> ties, double[] yaw, double[] pitch, double[] roll) {
+        double[] err = new double[ties.size()];
+        int n = 0;
+        for (PanelTie t : ties) {
+            double[] pa = VideoStreamingServer.panoramaXY(
+                    t.a, t.rayA, yaw[t.a], pitch[t.a], roll[t.a]);
+            double[] pb = VideoStreamingServer.panoramaXY(
+                    t.b, t.rayB, yaw[t.b], pitch[t.b], roll[t.b]);
+            double d = Math.hypot(pa[0] - pb[0], pa[1] - pb[1]);
+            if (pa[1] < -50 || pa[1] > 450 || pb[1] < -50 || pb[1] > 450) {
+                d = 160;
+            }
+            err[n++] = Math.min(160.0, d);
+        }
+        if (n < 6) {
+            return 1e6;
+        }
+        Arrays.sort(err, 0, n);
+        int keep = Math.max(6, (int) (n * 0.7));
+        double sum = 0;
+        for (int i = 0; i < keep; i++) {
+            sum += err[i];
+        }
+        return sum / keep;
+    }
+
+    /** Equidistant K,D so a solved mount pose can be stored when the feature fit was rejected. */
+    private static boolean saveEquidistant(int cam, Mat frame) {
+        if (frame == null || frame.empty()) {
+            return false;
+        }
+        int w = frame.cols();
+        int h = frame.rows();
+        double f = VideoStreamingServer.fisheyeFocal(
+                w, h, VideoStreamingServer.INPUT_FISHEYE_FOV_DEG);
+        String role = VideoStreamingServer.CAM_ROLE[cam];
+        CalibrationManager.CameraModel model = new CalibrationManager.CameraModel(
+                role, w, h, 0,
+                f, f,
+                w * VideoStreamingServer.FISHEYE_CX,
+                h * VideoStreamingServer.FISHEYE_CY,
+                0, 0, 0, 0,
+                true, false,
+                VideoStreamingServer.CAM_YAW_DEG[cam],
+                VideoStreamingServer.CAM_PITCH_DEG[cam],
+                VideoStreamingServer.CAM_ROLL_DEG[cam],
+                new double[] {0, 0, 0}, new double[] {0, 0, 0});
+        if (!CalibrationManager.stableIntrinsics(model)) {
+            return false;
+        }
+        if (!CalibrationManager.save(model)) {
+            return false;
+        }
+        System.out.println("  " + role + ": equidistant lens saved so the mount pose can be stored");
+        return true;
+    }
+
+    private static final class PanelTie {
+        final int a;
+        final int b;
+        final double ua;
+        final double va;
+        final double ub;
+        final double vb;
+        final double[] rayA;
+        final double[] rayB;
+
+        PanelTie(int a, int b, double ua, double va, double ub, double vb,
+                 double[] rayA, double[] rayB) {
+            this.a = a;
+            this.b = b;
+            this.ua = ua;
+            this.va = va;
+            this.ub = ub;
+            this.vb = vb;
+            this.rayA = rayA;
+            this.rayB = rayB;
+        }
     }
 
     private static void optimizeGroundLines(List<Chain>[] chains, Mat[] frames,

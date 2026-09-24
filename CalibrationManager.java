@@ -192,7 +192,7 @@ public final class CalibrationManager {
         while (yawDelta < -180) {
             yawDelta += 360;
         }
-        return Math.abs(yawDelta) <= 10
+        return Math.abs(yawDelta) <= 15
                 && Math.abs(m.pitchDeg - VideoStreamingServer.CAM_PITCH_DEG[camIndex]) <= 8
                 && Math.abs(m.rollDeg - VideoStreamingServer.CAM_ROLL_DEG[camIndex]) <= 6;
     }
