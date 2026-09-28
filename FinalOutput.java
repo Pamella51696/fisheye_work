@@ -63,7 +63,7 @@ final class FinalOutput {
             return 2;
         }
         System.out.println("estimate effective fisheye parameters (K / D / FOV / center)");
-        int estimated = LineFisheyeCalibrator.run(folder);
+        int estimated = LineFisheyeCalibrator.estimateIntrinsics(folder);
         if (estimated != 0) {
             System.out.println("  lens estimate did not finish; continuing with the current model");
         }
@@ -84,6 +84,14 @@ final class FinalOutput {
         loadPose(frames, yaw, pitch, roll);
 
         System.out.println("fisheye correction");
+        GroundSurround.Lens[] lenses = lenses(frames, yaw, pitch, roll);
+        for (int i = 0; i < 4; i++) {
+            Mat corrected = GroundSurround.cameraBev(frames[i], lenses[i]);
+            System.out.println("  " + VideoStreamingServer.CAM_ROLE[i]
+                    + "  ground pixels " + groundPixels(corrected));
+            corrected.release();
+        }
+
         System.out.println("detect ground-plane features");
         System.out.println("  straight lines");
         System.out.println("  ORB + RANSAC");
@@ -92,12 +100,16 @@ final class FinalOutput {
         savePose(frames, yaw, pitch, roll);
 
         System.out.println("common vehicle ground plane");
-        System.out.println("BEV");
-        GroundSurround.Lens[] lenses = lenses(frames, yaw, pitch, roll);
+        lenses = lenses(frames, yaw, pitch, roll);
         Mat[] bev = new Mat[4];
-        for (int i = 0; i < 4; i++) {
+        int[] place = { 1, 0, 2, 3 };
+        for (int n = 0; n < place.length; n++) {
+            int i = place[n];
+            if (i == 3) {
+                System.out.println("rear");
+            }
             bev[i] = GroundSurround.cameraBev(frames[i], lenses[i]);
-            System.out.println("  " + VideoStreamingServer.CAM_ROLE[i] + " on ground plane");
+            System.out.println("  " + VideoStreamingServer.CAM_ROLE[i]);
         }
 
         System.out.println("photometric correction");
@@ -112,6 +124,7 @@ final class FinalOutput {
         optimizeSeams(frames, yaw, pitch, roll, gains);
         savePose(frames, yaw, pitch, roll);
 
+        System.out.println("BEV");
         System.out.println("final output");
         lenses = lenses(frames, yaw, pitch, roll);
         GroundSurround surround = new GroundSurround();
@@ -131,6 +144,19 @@ final class FinalOutput {
         }
         System.out.println("Wrote " + file.toAbsolutePath());
         return 0;
+    }
+
+    private static int groundPixels(Mat bev) {
+        int n = 0;
+        for (int r = 0; r < bev.rows(); r += 4) {
+            for (int c = 0; c < bev.cols(); c += 4) {
+                double[] px = bev.get(r, c);
+                if (px != null && px[0] + px[1] + px[2] > 8) {
+                    n++;
+                }
+            }
+        }
+        return n * 16;
     }
 
     private static void reportLenses(Mat[] frames) {
