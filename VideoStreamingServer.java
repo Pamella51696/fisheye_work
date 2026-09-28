@@ -24,11 +24,15 @@ import org.opencv.videoio.VideoCapture;
 import org.opencv.videoio.Videoio;
  
 /**
- * Multi-camera panoramic projection with a shared vehicle-frame horizon.
+ * Four-camera surround view on one ground plane, plus the spherical panorama.
  *
- *   fisheye pixels → 3D rays → R_camera (extrinsics) → common vehicle frame
- *        → spherical (θ, φ) → LEFT | FRONT | RIGHT | REAR canvas → feather
+ *   frames → fisheye correction → metric canvas → common ground plane → blend
  *
+ *   java VideoStreamingServer --final
+ *   java VideoStreamingServer --surround-preview
+ *   java VideoStreamingServer                  (browser /play shows the surround)
+ *
+ * The spherical panorama remains at /stitch and --stitch-preview.
  * Horizon is φ = 0 in the vehicle frame (pose), not an image-space shift.
  * Clips are discovered in the working folder (left / front / right / rear).
  *
@@ -91,6 +95,22 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             return;
         }
 
+        if (GroundSurround.isSelfTestArgs(args)) {
+            int code = GroundSurround.selfTest();
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
+        if (FinalOutput.isSelfTestArgs(args)) {
+            int code = FinalOutput.selfTest();
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
         if (CalibrationManager.isChessboardCalibrateArgs(args)) {
             CalibrationManager.Options opt;
             try {
@@ -133,6 +153,24 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             return;
         }
 
+        if (FinalOutput.isArgs(args)) {
+            Path folder = Paths.get(".").toAbsolutePath().normalize();
+            int code = FinalOutput.run(folder);
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
+        if (GroundSurround.isPreviewArgs(args)) {
+            Path folder = Paths.get(".").toAbsolutePath().normalize();
+            int code = exportSurroundPreview(folder);
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
         if (CalibrationManager.isAlignMountsArgs(args)) {
             Path folder = Paths.get(".").toAbsolutePath().normalize();
             int code = alignMountPoseFromSeams(folder);
@@ -158,6 +196,7 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         }
 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+        server.createContext("/surround", new SurroundHandler(videos));
         server.createContext("/stitch", new StitchHandler(videos));
         server.createContext("/play",   new PlayerPageHandler());
         server.setExecutor(Executors.newFixedThreadPool(4));
@@ -219,6 +258,47 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         Path out = folder.resolve("stitch_preview.jpg");
         boolean ok = Imgcodecs.imwrite(out.toAbsolutePath().toString(), panorama);
         panorama.release();
+        if (!ok) {
+            System.err.println("Could not write " + out);
+            return 1;
+        }
+        System.out.println("Wrote " + out.toAbsolutePath());
+        return 0;
+    }
+
+    /**
+     * One top-down surround JPEG: extract a frame, project each camera onto
+     * the shared ground plane, blend.
+     */
+    static int exportSurroundPreview(Path folder) {
+        System.out.println("SURROUND VIEW");
+        System.out.println("frame extraction → fisheye → common ground plane → blend");
+        Mat[] frames = new Mat[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            String source = loadPreviewFrame(folder, CAM_ROLE[i], frames, i);
+            if (source == null) {
+                for (Mat m : frames) {
+                    if (m != null) {
+                        m.release();
+                    }
+                }
+                return 2;
+            }
+            System.out.println("  frame " + CAM_ROLE[i] + ": " + source);
+        }
+        GroundSurround surround = new GroundSurround();
+        Mat view = surround.render(frames);
+        for (Mat m : frames) {
+            if (m != null) {
+                m.release();
+            }
+        }
+        if (view == null || view.empty()) {
+            return 1;
+        }
+        Path out = folder.resolve("surround_preview.jpg");
+        boolean ok = Imgcodecs.imwrite(out.toAbsolutePath().toString(), view);
+        view.release();
         if (!ok) {
             System.err.println("Could not write " + out);
             return 1;
@@ -474,7 +554,30 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         }
     }
 
-    private static boolean readFirstFrame(Path clip, Mat[] frames, int index) {
+    /** First decoded frame of each existing feed. */
+    static Mat[] representativeFrames(Path folder) {
+        Path[] clips = discoverClips(folder);
+        if (clips == null) {
+            return null;
+        }
+        Mat[] frames = new Mat[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            if (!readFirstFrame(clips[i], frames, i)) {
+                System.err.println("Could not read a frame from " + clips[i].getFileName());
+                for (Mat m : frames) {
+                    if (m != null) {
+                        m.release();
+                    }
+                }
+                return null;
+            }
+            System.out.println("  " + CAM_ROLE[i] + "  " + clips[i].getFileName()
+                    + "  " + frames[i].cols() + "x" + frames[i].rows());
+        }
+        return frames;
+    }
+
+    static boolean readFirstFrame(Path clip, Mat[] frames, int index) {
         Path decodable = ensureDecodable(clip);
         VideoCapture cap = openVideo(decodable);
         if (cap == null || !cap.isOpened()) {
@@ -683,12 +786,61 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         }
     }
  
+    private static class SurroundHandler implements HttpHandler {
+        private final Path[] videoFiles;
+        SurroundHandler(Path[] f) { this.videoFiles = f; }
+
+        @Override public void handle(HttpExchange ex) throws IOException {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            VideoCapture[] caps = new VideoCapture[videoFiles.length];
+            for (int i = 0; i < videoFiles.length; i++) {
+                caps[i] = openVideo(videoFiles[i]);
+                if (caps[i] == null || !caps[i].isOpened()) {
+                    System.err.println("Could not open video: " + videoFiles[i]);
+                    ex.sendResponseHeaders(500, -1);
+                    return;
+                }
+            }
+            GroundSurround surround = new GroundSurround();
+            ex.getResponseHeaders().set("Content-Type",
+                    "multipart/x-mixed-replace; boundary=frame");
+            ex.sendResponseHeaders(200, 0);
+            try (OutputStream out = ex.getResponseBody()) {
+                Mat[] frames = new Mat[videoFiles.length];
+                for (int i = 0; i < videoFiles.length; i++) {
+                    frames[i] = new Mat();
+                }
+                while (true) {
+                    boolean allReady = true;
+                    for (int i = 0; i < caps.length; i++) {
+                        if (!readOrLoop(caps, i, videoFiles[i], frames[i]) || frames[i].empty()) {
+                            allReady = false;
+                        }
+                    }
+                    if (!allReady) {
+                        continue;
+                    }
+                    Mat view = surround.render(frames);
+                    writeFrame(out, encodeJpeg(view));
+                    view.release();
+                }
+            } finally {
+                for (VideoCapture c : caps) {
+                    if (c != null) c.release();
+                }
+            }
+        }
+    }
+
     private static class PlayerPageHandler implements HttpHandler {
         @Override public void handle(HttpExchange ex) throws IOException {
             String html = "<!DOCTYPE html><html lang='en'><head>"
                 + "<meta charset='UTF-8'>"
                 + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>Common-horizon panorama</title>"
+                + "<title>Surround view</title>"
                 + "<style>"
                 + "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }"
                 + "html, body { height: 100%; background: #0a0a0f; color: #e0e0e0;"
@@ -704,9 +856,9 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
                 + ".pano-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }"
                 + "</style></head><body>"
                 + "<div class='container'>"
-                + "  <h1>common vehicle horizon</h1>"
+                + "  <h1>surround view · common ground plane</h1>"
                 + "  <div class='pano-wrap'>"
-                + "    <img src='/stitch' alt='stitched panorama'>"
+                + "    <img src='/surround' alt='surround view'>"
                 + "  </div>"
                 + "</div></body></html>";
             byte[] bytes = html.getBytes("UTF-8");
