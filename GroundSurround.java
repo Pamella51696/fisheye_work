@@ -78,10 +78,15 @@ final class GroundSurround {
         for (int i = 0; i < 4; i++) {
             lenses[i] = Lens.fromCalibration(i, frames[i].cols(), frames[i].rows());
         }
-        return render(frames, lenses);
+        return render(frames, lenses, FinalOutput.loadGains());
     }
 
     Mat render(Mat[] frames, Lens[] lenses) {
+        return render(frames, lenses, null);
+    }
+
+    /** {@code gains} is BGR per camera, or null for no photometric correction. */
+    Mat render(Mat[] frames, Lens[] lenses, double[][] gains) {
         ensureMaps(lenses);
         Mat acc = Mat.zeros(SIZE, SIZE, CvType.CV_32FC3);
         Mat wsum = Mat.zeros(SIZE, SIZE, CvType.CV_32FC1);
@@ -90,7 +95,8 @@ final class GroundSurround {
             warped[i] = new Mat();
             Imgproc.remap(frames[i], warped[i], map1[i], map2[i], Imgproc.INTER_LINEAR,
                     Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
-            accumulate(warped[i], weight[i], acc, wsum);
+            double[] gain = gains == null ? null : gains[i];
+            accumulate(warped[i], weight[i], acc, wsum, gain);
             warped[i].release();
         }
         Mat out = normalize(acc, wsum);
@@ -98,6 +104,67 @@ final class GroundSurround {
         acc.release();
         wsum.release();
         return out;
+    }
+
+    /**
+     * One camera on the common ground plane. Every ground point that camera
+     * can see is kept, so later stages can find lines and ORB points in the overlap.
+     */
+    static Mat cameraBev(Mat src, Lens lens) {
+        Mat mapX = new Mat(SIZE, SIZE, CvType.CV_32FC1);
+        Mat mapY = new Mat(SIZE, SIZE, CvType.CV_32FC1);
+        double mPerPx = (2.0 * HALF_EXTENT_M) / SIZE;
+        float[] rowX = new float[SIZE];
+        float[] rowY = new float[SIZE];
+        for (int row = 0; row < SIZE; row++) {
+            double x = (SIZE / 2.0 - (row + 0.5)) * mPerPx;
+            for (int col = 0; col < SIZE; col++) {
+                double y = ((col + 0.5) - SIZE / 2.0) * mPerPx;
+                float[] uv = projectGround(lens, x, y);
+                if (uv == null || insideVehicle(x, y)) {
+                    rowX[col] = -1f;
+                    rowY[col] = -1f;
+                } else {
+                    rowX[col] = uv[0];
+                    rowY[col] = uv[1];
+                }
+            }
+            mapX.put(row, 0, rowX);
+            mapY.put(row, 0, rowY);
+        }
+        Mat map1 = new Mat();
+        Mat map2 = new Mat();
+        Imgproc.convertMaps(mapX, mapY, map1, map2, CvType.CV_16SC2, false);
+        mapX.release();
+        mapY.release();
+        Mat dst = new Mat();
+        Imgproc.remap(src, dst, map1, map2, Imgproc.INTER_LINEAR,
+                Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
+        map1.release();
+        map2.release();
+        return dst;
+    }
+
+    static double[] groundOfPixel(int col, int row) {
+        double mPerPx = (2.0 * HALF_EXTENT_M) / SIZE;
+        double x = (SIZE / 2.0 - (row + 0.5)) * mPerPx;
+        double y = ((col + 0.5) - SIZE / 2.0) * mPerPx;
+        return new double[] { x, y };
+    }
+
+    /** Camera ray hit on Z = 0, in vehicle meters. */
+    static double[] intersectGround(Lens lens, double[] ray) {
+        double vx = lens.r[0] * ray[0] + lens.r[1] * ray[1] + lens.r[2] * ray[2];
+        double vy = lens.r[3] * ray[0] + lens.r[4] * ray[1] + lens.r[5] * ray[2];
+        double vz = lens.r[6] * ray[0] + lens.r[7] * ray[1] + lens.r[8] * ray[2];
+        if (vz >= -1e-4) {
+            return null;
+        }
+        double t = -lens.z / vz;
+        if (t <= 0) {
+            return null;
+        }
+        return new double[] { lens.x + t * vx, lens.y + t * vy };
     }
 
     private void ensureMaps(Lens[] lenses) {
@@ -205,13 +272,16 @@ final class GroundSurround {
         return new int[] { col, row };
     }
 
-    private static void accumulate(Mat warped, Mat w, Mat acc, Mat wsum) {
+    private static void accumulate(Mat warped, Mat w, Mat acc, Mat wsum, double[] gain) {
         Mat f = new Mat();
         warped.convertTo(f, CvType.CV_32FC3);
         List<Mat> ch = new ArrayList<>(3);
         Core.split(f, ch);
         for (int i = 0; i < 3; i++) {
             Core.multiply(ch.get(i), w, ch.get(i));
+            if (gain != null) {
+                Core.multiply(ch.get(i), new Scalar(gain[i]), ch.get(i));
+            }
         }
         Core.merge(ch, f);
         Core.add(acc, f, acc);
@@ -398,6 +468,17 @@ final class GroundSurround {
                 x, y, z, k[0], k[1], k[2], k[3], k1, k2, k3, k4,
                 r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], srcW, srcH
             };
+        }
+
+        Lens withMount(double yawDeg, double pitchDeg, double rollDeg) {
+            return new Lens(
+                    VideoStreamingServer.cameraToVehicle(yawDeg, pitchDeg, rollDeg),
+                    x, y, z, k, k1, k2, k3, k4, srcW, srcH);
+        }
+
+        /** Saved intrinsics, with an explicit mount. Nominal lens when no calib is stable. */
+        static Lens posed(int cam, int srcW, int srcH, double yawDeg, double pitchDeg, double rollDeg) {
+            return fromCalibration(cam, srcW, srcH).withMount(yawDeg, pitchDeg, rollDeg);
         }
     }
 }
