@@ -28,6 +28,7 @@ import org.opencv.videoio.Videoio;
  *
  *   frames → fisheye correction → metric canvas → common ground plane → blend
  *
+ *   java VideoStreamingServer --final
  *   java VideoStreamingServer --surround-preview
  *   java VideoStreamingServer                  (browser /play shows the surround)
  *
@@ -102,6 +103,14 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             return;
         }
 
+        if (FinalOutput.isSelfTestArgs(args)) {
+            int code = FinalOutput.selfTest();
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
         if (CalibrationManager.isChessboardCalibrateArgs(args)) {
             CalibrationManager.Options opt;
             try {
@@ -138,6 +147,15 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         if (isStitchPreviewArgs(args)) {
             Path folder = Paths.get(".").toAbsolutePath().normalize();
             int code = exportStitchPreview(folder);
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
+        if (FinalOutput.isArgs(args)) {
+            Path folder = Paths.get(".").toAbsolutePath().normalize();
+            int code = FinalOutput.run(folder);
             if (code != 0) {
                 System.exit(code);
             }
@@ -536,7 +554,30 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         }
     }
 
-    private static boolean readFirstFrame(Path clip, Mat[] frames, int index) {
+    /** First decoded frame of each existing feed. */
+    static Mat[] representativeFrames(Path folder) {
+        Path[] clips = discoverClips(folder);
+        if (clips == null) {
+            return null;
+        }
+        Mat[] frames = new Mat[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            if (!readFirstFrame(clips[i], frames, i)) {
+                System.err.println("Could not read a frame from " + clips[i].getFileName());
+                for (Mat m : frames) {
+                    if (m != null) {
+                        m.release();
+                    }
+                }
+                return null;
+            }
+            System.out.println("  " + CAM_ROLE[i] + "  " + clips[i].getFileName()
+                    + "  " + frames[i].cols() + "x" + frames[i].rows());
+        }
+        return frames;
+    }
+
+    static boolean readFirstFrame(Path clip, Mat[] frames, int index) {
         Path decodable = ensureDecodable(clip);
         VideoCapture cap = openVideo(decodable);
         if (cap == null || !cap.isOpened()) {
