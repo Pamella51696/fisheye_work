@@ -554,11 +554,32 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         }
     }
 
-    /** First decoded frame of each existing feed. */
+    /** Still of one feed shipped with the project, used when that clip is absent. */
+    static Path referenceStill(Path folder, String role) {
+        Path dir = folder.resolve("reference");
+        String r = role.toLowerCase(Locale.ROOT);
+        String[] names = { r + ".png", r + ".jpg", r + ".jpeg" };
+        for (String name : names) {
+            Path p = dir.resolve(name);
+            if (isUsableFile(p)) {
+                return p;
+            }
+        }
+        return null;
+    }
+
+    /** First decoded frame of each existing feed, or the reference stills. */
     static Mat[] representativeFrames(Path folder) {
-        Path[] clips = discoverClips(folder);
-        if (clips == null) {
-            return null;
+        Path[] clips = new Path[CAM_ROLE.length];
+        boolean videos = true;
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            clips[i] = findClip(folder, CAM_ROLE[i]);
+            if (clips[i] == null) {
+                videos = false;
+            }
+        }
+        if (!videos) {
+            return representativeStills(folder);
         }
         Mat[] frames = new Mat[CAM_ROLE.length];
         for (int i = 0; i < CAM_ROLE.length; i++) {
@@ -573,6 +594,37 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             }
             System.out.println("  " + CAM_ROLE[i] + "  " + clips[i].getFileName()
                     + "  " + frames[i].cols() + "x" + frames[i].rows());
+        }
+        return frames;
+    }
+
+    private static Mat[] representativeStills(Path folder) {
+        Mat[] frames = new Mat[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            Path still = referenceStill(folder, CAM_ROLE[i]);
+            if (still == null) {
+                still = findCalibStill(folder, CAM_ROLE[i]);
+            }
+            if (still == null) {
+                System.err.println("No " + CAM_ROLE[i]
+                        + " clip in " + folder
+                        + " (expected e.g. " + CAM_ROLE[i] + "_1.mp4 or reference/"
+                        + CAM_ROLE[i] + ".png)");
+                for (Mat m : frames) {
+                    if (m != null) {
+                        m.release();
+                    }
+                }
+                return null;
+            }
+            Mat bgr = Imgcodecs.imread(still.toAbsolutePath().toString());
+            if (bgr == null || bgr.empty()) {
+                System.err.println("Could not read " + still);
+                return null;
+            }
+            frames[i] = bgr;
+            System.out.println("  " + CAM_ROLE[i] + "  " + still.getFileName()
+                    + "  " + bgr.cols() + "x" + bgr.rows());
         }
         return frames;
     }
@@ -599,10 +651,13 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         if (clip != null && readFirstFrame(ensureDecodable(clip), frames, index)) {
             return clip.getFileName().toString() + " (first frame)";
         }
-        Path still = findCalibStill(folder, role);
+        Path still = referenceStill(folder, role);
+        if (still == null) {
+            still = findCalibStill(folder, role);
+        }
         if (still == null) {
             System.err.println("No preview for " + role
-                    + " (need " + role + "_1.mp4 or calib/" + role + "/ still)");
+                    + " (need " + role + "_1.mp4 or reference/" + role + ".png)");
             return null;
         }
         Mat bgr = Imgcodecs.imread(still.toAbsolutePath().toString());
