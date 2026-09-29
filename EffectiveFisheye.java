@@ -277,7 +277,7 @@ final class EffectiveFisheye {
         float[] rowY = new float[VIEW_W];
         for (int y = 0; y < VIEW_H; y++) {
             for (int x = 0; x < VIEW_W; x++) {
-                double[] ray = viewRay(x + 0.5, y + 0.5);
+                double[] ray = viewRay(x + 0.5, y + 0.5, VIEW_W, VIEW_H);
                 float[] uv = projectRay(ray[0], ray[1], ray[2], lens);
                 if (uv == null || uv[0] < 1 || uv[1] < 1
                         || uv[0] >= src.cols() - 1 || uv[1] >= src.rows() - 1) {
@@ -410,8 +410,8 @@ final class EffectiveFisheye {
             if (dm.length < 2 || dm[0].distance > 0.75 * dm[1].distance) {
                 continue;
             }
-            double[] ra = viewRay(pa[dm[0].queryIdx].pt.x, pa[dm[0].queryIdx].pt.y);
-            double[] rb = viewRay(pb[dm[0].trainIdx].pt.x, pb[dm[0].trainIdx].pt.y);
+            double[] ra = viewRay(pa[dm[0].queryIdx].pt.x, pa[dm[0].queryIdx].pt.y, VIEW_W, VIEW_H);
+            double[] rb = viewRay(pb[dm[0].trainIdx].pt.x, pb[dm[0].trainIdx].pt.y, VIEW_W, VIEW_H);
             if (ra != null && rb != null) {
                 raysA.add(ra);
                 raysB.add(rb);
@@ -437,10 +437,106 @@ final class EffectiveFisheye {
         return mask;
     }
 
+    /**
+     * Four 180° feeds in one frame: front, right, left, rear.
+     * This is what the browser shows instead of a top-down surround.
+     */
+    static Mat mosaic(Mat[] raw) {
+        final int fw = 640;
+        final int fh = 360;
+        Mat canvas = Mat.zeros(fh * 2, fw * 2, CvType.CV_8UC3);
+        int[] cams = {1, 2, 0, 3};
+        for (int s = 0; s < 4; s++) {
+            int cam = cams[s];
+            if (raw == null || cam >= raw.length || raw[cam] == null || raw[cam].empty()) {
+                continue;
+            }
+            Mat tile = feed(cam, raw[cam], fw, fh);
+            int x = (s % 2) * fw;
+            int y = (s / 2) * fh;
+            tile.copyTo(canvas.submat(y, y + fh, x, x + fw));
+            Imgproc.putText(canvas, VideoStreamingServer.CAM_ROLE[cam] + "  180 deg",
+                    new org.opencv.core.Point(x + 16, y + 36),
+                    Imgproc.FONT_HERSHEY_SIMPLEX, 0.9, new Scalar(255, 255, 255), 2, Imgproc.LINE_AA);
+            tile.release();
+        }
+        return canvas;
+    }
+
+    private static final Mat[] FEED_MAP1 = new Mat[4];
+    private static final Mat[] FEED_MAP2 = new Mat[4];
+    private static final int[] FEED_SRC_W = {-1, -1, -1, -1};
+    private static final int[] FEED_SRC_H = {-1, -1, -1, -1};
+
+    private static Mat feed(int cam, Mat src, int dstW, int dstH) {
+        if (FEED_MAP1[cam] == null || FEED_SRC_W[cam] != src.cols() || FEED_SRC_H[cam] != src.rows()) {
+            Lens lens = lensFor(cam, src.cols(), src.rows());
+            Mat mapX = new Mat(dstH, dstW, CvType.CV_32FC1);
+            Mat mapY = new Mat(dstH, dstW, CvType.CV_32FC1);
+            float[] rowX = new float[dstW];
+            float[] rowY = new float[dstW];
+            for (int y = 0; y < dstH; y++) {
+                for (int x = 0; x < dstW; x++) {
+                    double[] ray = viewRay(x + 0.5, y + 0.5, dstW, dstH);
+                    float[] uv = projectRay(ray[0], ray[1], ray[2], lens);
+                    if (uv == null || uv[0] < 1 || uv[1] < 1
+                            || uv[0] >= src.cols() - 1 || uv[1] >= src.rows() - 1) {
+                        rowX[x] = -1f;
+                        rowY[x] = -1f;
+                    } else {
+                        rowX[x] = uv[0];
+                        rowY[x] = uv[1];
+                    }
+                }
+                mapX.put(y, 0, rowX);
+                mapY.put(y, 0, rowY);
+            }
+            if (FEED_MAP1[cam] != null) {
+                FEED_MAP1[cam].release();
+                FEED_MAP2[cam].release();
+            }
+            FEED_MAP1[cam] = new Mat();
+            FEED_MAP2[cam] = new Mat();
+            Imgproc.convertMaps(mapX, mapY, FEED_MAP1[cam], FEED_MAP2[cam], CvType.CV_16SC2, false);
+            mapX.release();
+            mapY.release();
+            FEED_SRC_W[cam] = src.cols();
+            FEED_SRC_H[cam] = src.rows();
+        }
+        Mat dst = new Mat();
+        Imgproc.remap(src, dst, FEED_MAP1[cam], FEED_MAP2[cam],
+                Imgproc.INTER_LINEAR, Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
+        return dst;
+    }
+
+    private static Lens lensFor(int cam, int w, int h) {
+        CalibrationManager.CameraModel model =
+                CalibrationManager.load(VideoStreamingServer.CAM_ROLE[cam]);
+        Lens lens = new Lens();
+        if (CalibrationManager.stableIntrinsics(model)) {
+            double[] k = model.scaledK(w, h);
+            lens.fx = k[0];
+            lens.fy = k[1];
+            lens.cx = k[2];
+            lens.cy = k[3];
+            lens.k1 = model.k1;
+            lens.k2 = model.k2;
+            lens.k3 = model.k3;
+            lens.k4 = model.k4;
+        } else {
+            double f = VideoStreamingServer.fisheyeFocal(w, h, START_FOV_DEG);
+            lens.fx = f;
+            lens.fy = f;
+            lens.cx = w * 0.5;
+            lens.cy = h * 0.5;
+        }
+        return lens;
+    }
+
     /** Azimuth −90°..+90° across the width. Elevation spans the 16:9 frame. */
-    private static double[] viewRay(double u, double v) {
-        double az = (u / VIEW_W - 0.5) * Math.toRadians(VIEW_HFOV_DEG);
-        double el = (0.5 - v / VIEW_H) * Math.toRadians(VIEW_VFOV_DEG);
+    private static double[] viewRay(double u, double v, int w, int h) {
+        double az = (u / w - 0.5) * Math.toRadians(VIEW_HFOV_DEG);
+        double el = (0.5 - v / h) * Math.toRadians(VIEW_VFOV_DEG);
         double cosEl = Math.cos(el);
         return new double[] {
                 cosEl * Math.sin(az),
