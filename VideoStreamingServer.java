@@ -24,13 +24,13 @@ import org.opencv.videoio.VideoCapture;
 import org.opencv.videoio.Videoio;
  
 /**
- * Four-camera surround view on one ground plane, plus the spherical panorama.
+ * Four forward 180° camera feeds, plus the spherical panorama.
  *
- *   frames → fisheye correction → metric canvas → common ground plane → blend
+ *   frames → fisheye correction → 180° forward feed
  *
  *   java VideoStreamingServer --final
  *   java VideoStreamingServer --surround-preview
- *   java VideoStreamingServer                  (browser /play shows the surround)
+ *   java VideoStreamingServer                  (browser /play shows the 180° feeds)
  *
  * The spherical panorama remains at /stitch and --stitch-preview.
  * Horizon is φ = 0 in the vehicle frame (pose), not an image-space shift.
@@ -213,6 +213,7 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         }
 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+        server.createContext("/", new PlayerPageHandler());
         server.createContext("/surround", new SurroundHandler(videos));
         server.createContext("/stitch", new StitchHandler(videos));
         server.createContext("/play",   new PlayerPageHandler());

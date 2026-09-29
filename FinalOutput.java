@@ -23,10 +23,8 @@ import org.opencv.imgproc.Imgproc;
  *     → estimate K / D / FOV / center
  *     → fisheye correction
  *     → ground lines and ORB+RANSAC
- *     → camera pose on one vehicle ground plane
- *     → BEV
- *     → photometric correction
- *     → seam optimization
+ *     → camera pose
+ *     → 180° forward feeds
  *     → final output
  */
 final class FinalOutput {
@@ -124,11 +122,9 @@ final class FinalOutput {
         optimizeSeams(frames, yaw, pitch, roll, gains);
         savePose(frames, yaw, pitch, roll);
 
-        System.out.println("BEV");
+        System.out.println("180 degree feeds");
         System.out.println("final output");
-        lenses = lenses(frames, yaw, pitch, roll);
-        GroundSurround surround = new GroundSurround();
-        Mat out = surround.render(frames, lenses, gains);
+        Mat out = EffectiveFisheye.mosaic(frames);
         Path file = folder.resolve("final_output.jpg");
         boolean ok = Imgcodecs.imwrite(file.toAbsolutePath().toString(), out);
         out.release();
