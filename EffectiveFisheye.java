@@ -16,20 +16,21 @@ import org.opencv.imgproc.Imgproc;
 /**
  * Two-stage calibration for uncorrected fisheye feeds.
  *
- *   each camera alone: straight edges → K, D → 180° corrected view
- *   then ORB + RANSAC between neighbors → stitch
+ *   each camera alone: straight edges → K, D → 180° feed
+ *   then ORB + RANSAC between neighboring feeds
  *
- * A full 180° field cannot be a pinhole picture (the border would be at
- * infinity). The saved model is the 180°-class fisheye. The jpeg is the
- * widest perspective in which a straight curb stays a straight line.
+ * The output is a forward camera picture, not a top-down view.
+ * Horizontal angle runs from −90° to +90°, so the frame is a 180° field.
  */
 final class EffectiveFisheye {
 
     private static final double START_FOV_DEG = 200.0;
-    /** Perspective used to look at the corrected frame. */
-    private static final double VIEW_FOV_DEG = 150.0;
-    private static final int VIEW_W = 960;
-    private static final int VIEW_H = 540;
+    /** Horizontal field of the corrected feed. The side edges are ±90°. */
+    private static final double VIEW_HFOV_DEG = 180.0;
+    /** Vertical field at the same degrees per pixel, in a 16:9 feed. */
+    private static final double VIEW_VFOV_DEG = 101.25;
+    private static final int VIEW_W = 1280;
+    private static final int VIEW_H = 720;
 
     private EffectiveFisheye() {}
 
@@ -55,7 +56,7 @@ final class EffectiveFisheye {
 
     static int run(java.nio.file.Path folder) {
         System.out.println("STAGE 1  individual fisheye calibration");
-        System.out.println("uncorrected feed → straight edges → K, D → corrected view");
+        System.out.println("uncorrected feed → straight edges → K, D → 180° feed");
         Mat[] raw = VideoStreamingServer.representativeFrames(folder);
         if (raw == null) {
             return 2;
@@ -91,11 +92,11 @@ final class EffectiveFisheye {
             java.nio.file.Path file = outDir.resolve(role + ".jpg");
             Imgcodecs.imwrite(file.toString(), corrected[i]);
             System.out.println("  wrote " + file.toAbsolutePath());
-            System.out.println("  shown as a 150° perspective so a straight curb stays a straight line");
+            System.out.println("  180° feed: left edge −90°, right edge +90°");
         }
 
         System.out.println("STAGE 2  camera-to-camera alignment");
-        System.out.println("corrected views → ORB → RANSAC → stitch");
+        System.out.println("180° feeds → ORB → RANSAC");
         double[] yaw = VideoStreamingServer.CAM_YAW_DEG.clone();
         double[] pitch = VideoStreamingServer.CAM_PITCH_DEG.clone();
         double[] roll = VideoStreamingServer.CAM_ROLL_DEG.clone();
@@ -109,28 +110,6 @@ final class EffectiveFisheye {
             System.out.printf(Locale.US, "  %s yaw=%.2f pitch=%.2f roll=%.2f%n",
                     VideoStreamingServer.CAM_ROLE[i], yaw[i], pitch[i], roll[i]);
         }
-        GroundSurround.Lens[] ground = new GroundSurround.Lens[4];
-        for (int i = 0; i < 4; i++) {
-            if (lenses[i] == null) {
-                ground[i] = GroundSurround.Lens.posed(
-                        i, raw[i].cols(), raw[i].rows(), yaw[i], pitch[i], roll[i]);
-                continue;
-            }
-            Lens lens = lenses[i];
-            ground[i] = new GroundSurround.Lens(
-                    VideoStreamingServer.cameraToVehicle(yaw[i], pitch[i], roll[i]),
-                    GroundSurround.CAM_POS_M[i][0],
-                    GroundSurround.CAM_POS_M[i][1],
-                    GroundSurround.CAM_POS_M[i][2],
-                    new double[] {lens.fx, lens.fy, lens.cx, lens.cy},
-                    lens.k1, lens.k2, lens.k3, lens.k4,
-                    raw[i].cols(), raw[i].rows());
-        }
-        Mat surround = new GroundSurround().render(raw, ground, null);
-        java.nio.file.Path stitch = outDir.resolve("surround.jpg");
-        Imgcodecs.imwrite(stitch.toString(), surround);
-        System.out.println("Wrote " + stitch.toAbsolutePath());
-        surround.release();
         for (int i = 0; i < 4; i++) {
             if (raw[i] != null) {
                 raw[i].release();
@@ -287,20 +266,19 @@ final class EffectiveFisheye {
         return !CalibrationManager.distortionFolds(p[4], p[5], p[6], p[7]);
     }
 
-    /** Perspective view of the calibrated lens. Straight edges should come out straight. */
+    /**
+     * Forward 180° feed. Pixel x is azimuth, pixel y is elevation, both linear
+     * in angle, so the side edges are exactly ±90° from the optical axis.
+     */
     static Mat renderView(Mat src, Lens lens) {
-        double f = (VIEW_W * 0.5) / Math.tan(Math.toRadians(VIEW_FOV_DEG * 0.5));
         Mat mapX = new Mat(VIEW_H, VIEW_W, CvType.CV_32FC1);
         Mat mapY = new Mat(VIEW_H, VIEW_W, CvType.CV_32FC1);
         float[] rowX = new float[VIEW_W];
         float[] rowY = new float[VIEW_W];
-        double[] k = {lens.fx, lens.fy, lens.cx, lens.cy};
         for (int y = 0; y < VIEW_H; y++) {
-            double yn = (y - VIEW_H * 0.5) / f;
             for (int x = 0; x < VIEW_W; x++) {
-                double xn = (x - VIEW_W * 0.5) / f;
-                float[] uv = CalibrationManager.projectFisheye(
-                        xn, yn, 1, k, lens.k1, lens.k2, lens.k3, lens.k4);
+                double[] ray = viewRay(x + 0.5, y + 0.5);
+                float[] uv = projectRay(ray[0], ray[1], ray[2], lens);
                 if (uv == null || uv[0] < 1 || uv[1] < 1
                         || uv[0] >= src.cols() - 1 || uv[1] >= src.rows() - 1) {
                     rowX[x] = -1f;
@@ -459,12 +437,47 @@ final class EffectiveFisheye {
         return mask;
     }
 
+    /** Azimuth −90°..+90° across the width. Elevation spans the 16:9 frame. */
     private static double[] viewRay(double u, double v) {
-        double f = (VIEW_W * 0.5) / Math.tan(Math.toRadians(VIEW_FOV_DEG * 0.5));
-        double xn = (u - VIEW_W * 0.5) / f;
-        double yn = (v - VIEW_H * 0.5) / f;
-        double n = Math.sqrt(xn * xn + yn * yn + 1);
-        return new double[] { xn / n, yn / n, 1 / n };
+        double az = (u / VIEW_W - 0.5) * Math.toRadians(VIEW_HFOV_DEG);
+        double el = (0.5 - v / VIEW_H) * Math.toRadians(VIEW_VFOV_DEG);
+        double cosEl = Math.cos(el);
+        return new double[] {
+                cosEl * Math.sin(az),
+                -Math.sin(el),
+                cosEl * Math.cos(az)
+        };
+    }
+
+    /** Kannala–Brandt projection of a camera ray, including the 90° rim. */
+    private static float[] projectRay(double xc, double yc, double zc, Lens lens) {
+        double norm = Math.hypot(xc, Math.hypot(yc, zc));
+        if (norm < 1e-8) {
+            return null;
+        }
+        xc /= norm;
+        yc /= norm;
+        zc /= norm;
+        if (zc < 0) {
+            return null;
+        }
+        double radial = Math.hypot(xc, yc);
+        double theta = Math.atan2(radial, zc);
+        double t2 = theta * theta;
+        double t4 = t2 * t2;
+        double t6 = t4 * t2;
+        double t8 = t4 * t4;
+        double thetaD = theta * (1.0 + lens.k1 * t2 + lens.k2 * t4 + lens.k3 * t6 + lens.k4 * t8);
+        double deriv = 1.0 + 3.0 * lens.k1 * t2 + 5.0 * lens.k2 * t4
+                + 7.0 * lens.k3 * t6 + 9.0 * lens.k4 * t8;
+        if (deriv < 0.25 || thetaD < 0) {
+            return null;
+        }
+        double scale = radial > 1e-8 ? thetaD / radial : 0;
+        return new float[] {
+                (float) (lens.fx * xc * scale + lens.cx),
+                (float) (lens.fy * yc * scale + lens.cy)
+        };
     }
 
     private static double alignCost(List<double[]> raysA, List<double[]> raysB,
