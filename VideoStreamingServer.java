@@ -103,6 +103,14 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             return;
         }
 
+        if (EffectiveFisheye.isSelfTestArgs(args)) {
+            int code = EffectiveFisheye.selfTest();
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
         if (FinalOutput.isSelfTestArgs(args)) {
             int code = FinalOutput.selfTest();
             if (code != 0) {
@@ -147,6 +155,15 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         if (isStitchPreviewArgs(args)) {
             Path folder = Paths.get(".").toAbsolutePath().normalize();
             int code = exportStitchPreview(folder);
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
+        if (EffectiveFisheye.isArgs(args)) {
+            Path folder = Paths.get(".").toAbsolutePath().normalize();
+            int code = EffectiveFisheye.run(folder);
             if (code != 0) {
                 System.exit(code);
             }
@@ -267,12 +284,11 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
     }
 
     /**
-     * One top-down surround JPEG: extract a frame, project each camera onto
-     * the shared ground plane, blend.
+     * One JPEG of the four 180° forward feeds.
      */
     static int exportSurroundPreview(Path folder) {
-        System.out.println("SURROUND VIEW");
-        System.out.println("frame extraction → fisheye → common ground plane → blend");
+        System.out.println("180° FEEDS");
+        System.out.println("frame extraction → fisheye → 180° forward feed");
         Mat[] frames = new Mat[CAM_ROLE.length];
         for (int i = 0; i < CAM_ROLE.length; i++) {
             String source = loadPreviewFrame(folder, CAM_ROLE[i], frames, i);
@@ -286,8 +302,7 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             }
             System.out.println("  frame " + CAM_ROLE[i] + ": " + source);
         }
-        GroundSurround surround = new GroundSurround();
-        Mat view = surround.render(frames);
+        Mat view = EffectiveFisheye.mosaic(frames);
         for (Mat m : frames) {
             if (m != null) {
                 m.release();
@@ -554,11 +569,32 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         }
     }
 
-    /** First decoded frame of each existing feed. */
+    /** Still of one feed shipped with the project, used when that clip is absent. */
+    static Path referenceStill(Path folder, String role) {
+        Path dir = folder.resolve("reference");
+        String r = role.toLowerCase(Locale.ROOT);
+        String[] names = { r + ".png", r + ".jpg", r + ".jpeg" };
+        for (String name : names) {
+            Path p = dir.resolve(name);
+            if (isUsableFile(p)) {
+                return p;
+            }
+        }
+        return null;
+    }
+
+    /** First decoded frame of each existing feed, or the reference stills. */
     static Mat[] representativeFrames(Path folder) {
-        Path[] clips = discoverClips(folder);
-        if (clips == null) {
-            return null;
+        Path[] clips = new Path[CAM_ROLE.length];
+        boolean videos = true;
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            clips[i] = findClip(folder, CAM_ROLE[i]);
+            if (clips[i] == null) {
+                videos = false;
+            }
+        }
+        if (!videos) {
+            return representativeStills(folder);
         }
         Mat[] frames = new Mat[CAM_ROLE.length];
         for (int i = 0; i < CAM_ROLE.length; i++) {
@@ -573,6 +609,37 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             }
             System.out.println("  " + CAM_ROLE[i] + "  " + clips[i].getFileName()
                     + "  " + frames[i].cols() + "x" + frames[i].rows());
+        }
+        return frames;
+    }
+
+    private static Mat[] representativeStills(Path folder) {
+        Mat[] frames = new Mat[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            Path still = referenceStill(folder, CAM_ROLE[i]);
+            if (still == null) {
+                still = findCalibStill(folder, CAM_ROLE[i]);
+            }
+            if (still == null) {
+                System.err.println("No " + CAM_ROLE[i]
+                        + " clip in " + folder
+                        + " (expected e.g. " + CAM_ROLE[i] + "_1.mp4 or reference/"
+                        + CAM_ROLE[i] + ".png)");
+                for (Mat m : frames) {
+                    if (m != null) {
+                        m.release();
+                    }
+                }
+                return null;
+            }
+            Mat bgr = Imgcodecs.imread(still.toAbsolutePath().toString());
+            if (bgr == null || bgr.empty()) {
+                System.err.println("Could not read " + still);
+                return null;
+            }
+            frames[i] = bgr;
+            System.out.println("  " + CAM_ROLE[i] + "  " + still.getFileName()
+                    + "  " + bgr.cols() + "x" + bgr.rows());
         }
         return frames;
     }
@@ -599,10 +666,13 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         if (clip != null && readFirstFrame(ensureDecodable(clip), frames, index)) {
             return clip.getFileName().toString() + " (first frame)";
         }
-        Path still = findCalibStill(folder, role);
+        Path still = referenceStill(folder, role);
+        if (still == null) {
+            still = findCalibStill(folder, role);
+        }
         if (still == null) {
             System.err.println("No preview for " + role
-                    + " (need " + role + "_1.mp4 or calib/" + role + "/ still)");
+                    + " (need " + role + "_1.mp4 or reference/" + role + ".png)");
             return null;
         }
         Mat bgr = Imgcodecs.imread(still.toAbsolutePath().toString());
@@ -804,7 +874,6 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
                     return;
                 }
             }
-            GroundSurround surround = new GroundSurround();
             ex.getResponseHeaders().set("Content-Type",
                     "multipart/x-mixed-replace; boundary=frame");
             ex.sendResponseHeaders(200, 0);
@@ -823,7 +892,7 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
                     if (!allReady) {
                         continue;
                     }
-                    Mat view = surround.render(frames);
+                    Mat view = EffectiveFisheye.mosaic(frames);
                     writeFrame(out, encodeJpeg(view));
                     view.release();
                 }
@@ -840,7 +909,7 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             String html = "<!DOCTYPE html><html lang='en'><head>"
                 + "<meta charset='UTF-8'>"
                 + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>Surround view</title>"
+                + "<title>180° feeds</title>"
                 + "<style>"
                 + "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }"
                 + "html, body { height: 100%; background: #0a0a0f; color: #e0e0e0;"
@@ -856,9 +925,9 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
                 + ".pano-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }"
                 + "</style></head><body>"
                 + "<div class='container'>"
-                + "  <h1>surround view · common ground plane</h1>"
+                + "  <h1>180° feeds</h1>"
                 + "  <div class='pano-wrap'>"
-                + "    <img src='/surround' alt='surround view'>"
+                + "    <img src='/surround' alt='180 degree feeds'>"
                 + "  </div>"
                 + "</div></body></html>";
             byte[] bytes = html.getBytes("UTF-8");

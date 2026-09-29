@@ -48,11 +48,22 @@ public final class LineFisheyeCalibrator {
         return false;
     }
 
+    /** K, D, center, and FOV only. Pose is solved later on the ground plane. */
+    static int estimateIntrinsics(java.nio.file.Path folder) {
+        return run(folder, false);
+    }
+
     static int run(java.nio.file.Path folder) {
-        System.out.println("LINE CALIBRATION (main)");
-        System.out.println("Existing video → common features → undistortion K,D → RANSAC → ground lines");
-        System.out.println("Working folder: " + folder);
-        System.out.println();
+        return run(folder, true);
+    }
+
+    private static int run(java.nio.file.Path folder, boolean solvePose) {
+        if (solvePose) {
+            System.out.println("LINE CALIBRATION (main)");
+            System.out.println("Existing video → common features → undistortion K,D → RANSAC → ground lines");
+            System.out.println("Working folder: " + folder);
+            System.out.println();
+        }
 
         java.nio.file.Path[] clips = VideoStreamingServer.discoverClips(folder);
         if (clips == null) {
@@ -145,6 +156,18 @@ public final class LineFisheyeCalibrator {
                         "K,D %s  f=%.2f cx=%.1f cy=%.1f  D=[%.4f %.4f 0 0]  error=%.3f deg%n",
                         role, fit.f, fit.cx, fit.cy, fit.k1, fit.k2, fit.rmsDeg);
             }
+        }
+
+        if (!solvePose) {
+            for (int i = 0; i < 4; i++) {
+                if (preview[i] != null) {
+                    preview[i].release();
+                }
+                if (extra[i] != null) {
+                    extra[i].release();
+                }
+            }
+            return saved > 0 ? 0 : 2;
         }
 
         System.out.println("undistortion/projection");
@@ -726,6 +749,22 @@ public final class LineFisheyeCalibrator {
         return v[0] * (m[0] * v[0] + m[1] * v[1] + m[2] * v[2])
                 + v[1] * (m[3] * v[0] + m[4] * v[1] + m[5] * v[2])
                 + v[2] * (m[6] * v[0] + m[7] * v[1] + m[8] * v[2]);
+    }
+
+    /** Polylines of straight-world edges, each entry a sequence of {u, v} points. */
+    static List<double[][]> straightChains(Mat bgr) {
+        List<double[][]> out = new ArrayList<>();
+        for (Chain chain : detectChains(bgr)) {
+            if (chain.pts.size() < 6) {
+                continue;
+            }
+            double[][] pts = new double[chain.pts.size()][];
+            for (int i = 0; i < chain.pts.size(); i++) {
+                pts[i] = chain.pts.get(i);
+            }
+            out.add(pts);
+        }
+        return out;
     }
 
     private static List<Chain> detectChains(Mat bgr) {
