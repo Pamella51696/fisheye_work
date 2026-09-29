@@ -122,7 +122,7 @@ final class FinalOutput {
         optimizeSeams(frames, yaw, pitch, roll, gains);
         savePose(frames, yaw, pitch, roll);
 
-        System.out.println("180 degree feeds");
+        System.out.println("180 degree linear stitch");
         System.out.println("final output");
         Mat out = EffectiveFisheye.mosaic(frames);
         Path file = folder.resolve("final_output.jpg");

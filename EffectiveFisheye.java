@@ -437,30 +437,157 @@ final class EffectiveFisheye {
         return mask;
     }
 
+    /** One linear picture. Left edge is 90° left, right edge is 90° right. */
+    private static final int LIN_W = 1600;
+    private static final int LIN_H = 480;
+    private static final double LIN_PITCH_DEG = 78.0;
+    private static final double LIN_HORIZON = 0.42;
+
+    private static final Mat[] LIN_MAP1 = new Mat[4];
+    private static final Mat[] LIN_MAP2 = new Mat[4];
+    private static final Mat[] LIN_WGT = new Mat[4];
+    private static final int[] LIN_SRC_W = {-1, -1, -1, -1};
+    private static final int[] LIN_SRC_H = {-1, -1, -1, -1};
+
     /**
-     * Four 180° feeds in one frame: front, right, left, rear.
-     * This is what the browser shows instead of a top-down surround.
+     * One 180° linear feed. Yaw runs from −90° to +90° across the width,
+     * and left, front, and right are blended where they see the same direction.
      */
     static Mat mosaic(Mat[] raw) {
-        final int fw = 640;
-        final int fh = 360;
-        Mat canvas = Mat.zeros(fh * 2, fw * 2, CvType.CV_8UC3);
-        int[] cams = {1, 2, 0, 3};
-        for (int s = 0; s < 4; s++) {
-            int cam = cams[s];
+        Mat acc = Mat.zeros(LIN_H, LIN_W, CvType.CV_32FC3);
+        Mat wsum = Mat.zeros(LIN_H, LIN_W, CvType.CV_32FC1);
+        Mat sample = new Mat();
+        Mat sampleF = new Mat();
+        java.util.List<Mat> ch = new java.util.ArrayList<>();
+        for (int cam = 0; cam < 4; cam++) {
             if (raw == null || cam >= raw.length || raw[cam] == null || raw[cam].empty()) {
                 continue;
             }
-            Mat tile = feed(cam, raw[cam], fw, fh);
-            int x = (s % 2) * fw;
-            int y = (s / 2) * fh;
-            tile.copyTo(canvas.submat(y, y + fh, x, x + fw));
-            Imgproc.putText(canvas, VideoStreamingServer.CAM_ROLE[cam] + "  180 deg",
-                    new org.opencv.core.Point(x + 16, y + 36),
-                    Imgproc.FONT_HERSHEY_SIMPLEX, 0.9, new Scalar(255, 255, 255), 2, Imgproc.LINE_AA);
-            tile.release();
+            ensureLinear(cam, raw[cam].cols(), raw[cam].rows());
+            Imgproc.remap(raw[cam], sample, LIN_MAP1[cam], LIN_MAP2[cam],
+                    Imgproc.INTER_LINEAR, Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
+            sample.convertTo(sampleF, CvType.CV_32FC3);
+            Core.split(sampleF, ch);
+            for (int c = 0; c < ch.size(); c++) {
+                Core.multiply(ch.get(c), LIN_WGT[cam], ch.get(c));
+            }
+            Core.merge(ch, sampleF);
+            Core.add(acc, sampleF, acc);
+            Core.add(wsum, LIN_WGT[cam], wsum);
+            for (Mat m : ch) {
+                m.release();
+            }
+            ch.clear();
         }
-        return canvas;
+        sample.release();
+        sampleF.release();
+        Mat outF = new Mat();
+        Mat safe = new Mat();
+        Core.max(wsum, new Scalar(1e-4), safe);
+        java.util.List<Mat> accCh = new java.util.ArrayList<>();
+        Core.split(acc, accCh);
+        for (int c = 0; c < accCh.size(); c++) {
+            Core.divide(accCh.get(c), safe, accCh.get(c));
+        }
+        Core.merge(accCh, outF);
+        for (Mat m : accCh) {
+            m.release();
+        }
+        Mat out = new Mat();
+        outF.convertTo(out, CvType.CV_8UC3);
+        acc.release();
+        wsum.release();
+        safe.release();
+        outF.release();
+        return out;
+    }
+
+    private static void ensureLinear(int cam, int srcW, int srcH) {
+        if (LIN_MAP1[cam] != null && LIN_SRC_W[cam] == srcW && LIN_SRC_H[cam] == srcH) {
+            return;
+        }
+        Lens lens = lensFor(cam, srcW, srcH);
+        double[] pose = VideoStreamingServer.cameraToVehicle(
+                VideoStreamingServer.CAM_YAW_DEG[cam],
+                VideoStreamingServer.CAM_PITCH_DEG[cam],
+                VideoStreamingServer.CAM_ROLL_DEG[cam]);
+        double yaw = Math.toRadians(VideoStreamingServer.CAM_YAW_DEG[cam]);
+        Mat mapX = new Mat(LIN_H, LIN_W, CvType.CV_32FC1);
+        Mat mapY = new Mat(LIN_H, LIN_W, CvType.CV_32FC1);
+        Mat weight = new Mat(LIN_H, LIN_W, CvType.CV_32FC1);
+        float[] rowX = new float[LIN_W];
+        float[] rowY = new float[LIN_W];
+        float[] rowW = new float[LIN_W];
+        double pitchSpan = Math.toRadians(LIN_PITCH_DEG);
+        double horizonY = LIN_HORIZON * LIN_H;
+        for (int v = 0; v < LIN_H; v++) {
+            double phi = (horizonY - v) / LIN_H * pitchSpan;
+            double cphi = Math.cos(phi);
+            double sphi = Math.sin(phi);
+            for (int u = 0; u < LIN_W; u++) {
+                double theta = -Math.PI / 2.0 + (u + 0.5) / LIN_W * Math.PI;
+                double xv = cphi * Math.cos(theta);
+                double yv = cphi * Math.sin(theta);
+                double zv = sphi;
+                double xc = pose[0] * xv + pose[3] * yv + pose[6] * zv;
+                double yc = pose[1] * xv + pose[4] * yv + pose[7] * zv;
+                double zc = pose[2] * xv + pose[5] * yv + pose[8] * zv;
+                float[] uv = projectRay(xc, yc, zc, lens);
+                double mine = Math.abs(wrapPi(theta - yaw));
+                double best = Math.PI;
+                for (double other : VideoStreamingServer.CAM_YAW_DEG) {
+                    double d = Math.abs(wrapPi(theta - Math.toRadians(other)));
+                    if (d < best) {
+                        best = d;
+                    }
+                }
+                double feather = Math.toRadians(14);
+                double w;
+                if (mine <= best + 1e-6) {
+                    w = 1.0;
+                } else if (mine >= best + feather) {
+                    w = 0.0;
+                } else {
+                    w = 1.0 - (mine - best) / feather;
+                }
+                if (uv == null || w <= 0 || uv[0] < 1 || uv[1] < 1
+                        || uv[0] >= srcW - 1 || uv[1] >= srcH - 1) {
+                    rowX[u] = -1f;
+                    rowY[u] = -1f;
+                    rowW[u] = 0f;
+                } else {
+                    rowX[u] = uv[0];
+                    rowY[u] = uv[1];
+                    rowW[u] = (float) w;
+                }
+            }
+            mapX.put(v, 0, rowX);
+            mapY.put(v, 0, rowY);
+            weight.put(v, 0, rowW);
+        }
+        if (LIN_MAP1[cam] != null) {
+            LIN_MAP1[cam].release();
+            LIN_MAP2[cam].release();
+            LIN_WGT[cam].release();
+        }
+        LIN_MAP1[cam] = new Mat();
+        LIN_MAP2[cam] = new Mat();
+        Imgproc.convertMaps(mapX, mapY, LIN_MAP1[cam], LIN_MAP2[cam], CvType.CV_16SC2, false);
+        mapX.release();
+        mapY.release();
+        LIN_WGT[cam] = weight;
+        LIN_SRC_W[cam] = srcW;
+        LIN_SRC_H[cam] = srcH;
+    }
+
+    private static double wrapPi(double a) {
+        while (a > Math.PI) {
+            a -= 2 * Math.PI;
+        }
+        while (a < -Math.PI) {
+            a += 2 * Math.PI;
+        }
+        return a;
     }
 
     private static final Mat[] FEED_MAP1 = new Mat[4];

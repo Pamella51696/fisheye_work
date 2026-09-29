@@ -24,13 +24,13 @@ import org.opencv.videoio.VideoCapture;
 import org.opencv.videoio.Videoio;
  
 /**
- * Four forward 180° camera feeds, plus the spherical panorama.
+ * One linear 180° stitched feed, plus the spherical panorama.
  *
- *   frames → fisheye correction → 180° forward feed
+ *   frames → fisheye correction → blend on a 180° line
  *
  *   java VideoStreamingServer --final
  *   java VideoStreamingServer --surround-preview
- *   java VideoStreamingServer                  (browser /play shows the 180° feeds)
+ *   java VideoStreamingServer                  (browser /play shows the stitched feed)
  *
  * The spherical panorama remains at /stitch and --stitch-preview.
  * Horizon is φ = 0 in the vehicle frame (pose), not an image-space shift.
@@ -288,8 +288,8 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
      * One JPEG of the four 180° forward feeds.
      */
     static int exportSurroundPreview(Path folder) {
-        System.out.println("180° FEEDS");
-        System.out.println("frame extraction → fisheye → 180° forward feed");
+        System.out.println("180° LINEAR STITCH");
+        System.out.println("frame extraction → fisheye → one 180° feed");
         Mat[] frames = new Mat[CAM_ROLE.length];
         for (int i = 0; i < CAM_ROLE.length; i++) {
             String source = loadPreviewFrame(folder, CAM_ROLE[i], frames, i);
@@ -910,7 +910,7 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             String html = "<!DOCTYPE html><html lang='en'><head>"
                 + "<meta charset='UTF-8'>"
                 + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>180° feeds</title>"
+                + "<title>180° linear stitch</title>"
                 + "<style>"
                 + "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }"
                 + "html, body { height: 100%; background: #0a0a0f; color: #e0e0e0;"
@@ -926,9 +926,9 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
                 + ".pano-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }"
                 + "</style></head><body>"
                 + "<div class='container'>"
-                + "  <h1>180° feeds</h1>"
+                + "  <h1>180° linear stitch</h1>"
                 + "  <div class='pano-wrap'>"
-                + "    <img src='/surround' alt='180 degree feeds'>"
+                + "    <img src='/surround' alt='180 degree linear stitch'>"
                 + "  </div>"
                 + "</div></body></html>";
             byte[] bytes = html.getBytes("UTF-8");
