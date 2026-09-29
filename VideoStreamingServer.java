@@ -103,6 +103,14 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
             return;
         }
 
+        if (EffectiveFisheye.isSelfTestArgs(args)) {
+            int code = EffectiveFisheye.selfTest();
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
         if (FinalOutput.isSelfTestArgs(args)) {
             int code = FinalOutput.selfTest();
             if (code != 0) {
@@ -147,6 +155,15 @@ private static final double MAX_INCIDENCE_DEG = 78.0;
         if (isStitchPreviewArgs(args)) {
             Path folder = Paths.get(".").toAbsolutePath().normalize();
             int code = exportStitchPreview(folder);
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
+        if (EffectiveFisheye.isArgs(args)) {
+            Path folder = Paths.get(".").toAbsolutePath().normalize();
+            int code = EffectiveFisheye.run(folder);
             if (code != 0) {
                 System.exit(code);
             }
