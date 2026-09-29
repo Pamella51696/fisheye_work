@@ -751,6 +751,22 @@ public final class LineFisheyeCalibrator {
                 + v[2] * (m[6] * v[0] + m[7] * v[1] + m[8] * v[2]);
     }
 
+    /** Polylines of straight-world edges, each entry a sequence of {u, v} points. */
+    static List<double[][]> straightChains(Mat bgr) {
+        List<double[][]> out = new ArrayList<>();
+        for (Chain chain : detectChains(bgr)) {
+            if (chain.pts.size() < 6) {
+                continue;
+            }
+            double[][] pts = new double[chain.pts.size()][];
+            for (int i = 0; i < chain.pts.size(); i++) {
+                pts[i] = chain.pts.get(i);
+            }
+            out.add(pts);
+        }
+        return out;
+    }
+
     private static List<Chain> detectChains(Mat bgr) {
         Mat gray = new Mat();
         if (bgr.channels() == 1) {
