@@ -20,11 +20,15 @@ import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.Imgproc;
 import org.opencv.videoio.VideoCapture;
 import org.opencv.videoio.Videoio;
+
+import fisheye.FisheyeCalibrationStore;
+import fisheye.FisheyeUndistortion;
  
 /**
  * Multi-camera panoramic projection with a shared vehicle-frame horizon.
  *
- *   fisheye pixels → 3D rays → R_camera (extrinsics) → common vehicle frame
+ *   fisheye pixels → Kannala–Brandt undistort → rectilinear → 3D rays
+ *        → R_camera (extrinsics) → common vehicle frame
  *        → spherical (θ, φ) → LEFT | FRONT | RIGHT | REAR canvas → feather
  *
  * Horizon is φ = 0 in the vehicle frame (pose), not an image-space shift.
@@ -177,10 +181,11 @@ private static final double FISHEYE_CY = 0.50;
             }
  
             SphericalPanel[] panels = new SphericalPanel[videoFiles.length];
+            FisheyeUndistortion[] undistort = new FisheyeUndistortion[videoFiles.length];
             for (int i = 0; i < panels.length; i++) {
                 panels[i] = new SphericalPanel(i);
             }
- 
+
             int overlap = panelOverlapPx();
             ex.getResponseHeaders().set("Content-Type",
                     "multipart/x-mixed-replace; boundary=frame");
@@ -188,12 +193,14 @@ private static final double FISHEYE_CY = 0.50;
  
             try (OutputStream out = ex.getResponseBody()) {
                 Mat[] frames = new Mat[videoFiles.length];
+                Mat[] rect   = new Mat[videoFiles.length];
                 Mat[] ready  = new Mat[videoFiles.length];
                 for (int i = 0; i < videoFiles.length; i++) {
                     frames[i] = new Mat();
+                    rect[i]   = new Mat();
                     ready[i]  = new Mat();
                 }
- 
+
                 while (true) {
                     boolean allReady = true;
                     for (int i = 0; i < caps.length; i++) {
@@ -201,7 +208,23 @@ private static final double FISHEYE_CY = 0.50;
                             allReady = false;
                             continue;
                         }
-                        panels[i].project(frames[i], ready[i]);
+                        if (undistort[i] == null) {
+                            undistort[i] = new FisheyeUndistortion(
+                                    FisheyeCalibrationStore.forCamera(
+                                            CAM_ROLE[i],
+                                            frames[i].cols(),
+                                            frames[i].rows(),
+                                            INPUT_FISHEYE_FOV_DEG,
+                                            FISHEYE_CX,
+                                            FISHEYE_CY));
+                            panels[i].setRectilinearIntrinsics(
+                                    undistort[i].rectFx(),
+                                    undistort[i].rectFy(),
+                                    undistort[i].rectCx(),
+                                    undistort[i].rectCy());
+                        }
+                        undistort[i].undistort(frames[i], rect[i]);
+                        panels[i].project(rect[i], ready[i]);
                         if (ready[i].empty()
                                 || ready[i].cols() != PANEL_WIDTH
                                 || ready[i].rows() != PANEL_HEIGHT) {
@@ -258,11 +281,15 @@ private static final double FISHEYE_CY = 0.50;
  
     /**
      * One surround camera: spherical dest pixels are inverse-projected through
-     * the vehicle frame and the fisheye model into the raw frame.
+     * the vehicle frame and pinhole intrinsics into the undistorted frame.
      */
     static final class SphericalPanel {
         private final int index;
         private final double[] R; // camera-to-vehicle, row-major
+        private double rectFx = -1;
+        private double rectFy = -1;
+        private double rectCx;
+        private double rectCy;
         private Mat map1;
         private Mat map2;
         private int cachedSrcW = -1;
@@ -273,7 +300,18 @@ private static final double FISHEYE_CY = 0.50;
             this.R = cameraToVehicle(CAM_YAW_DEG[index],
                     CAM_PITCH_DEG[index], CAM_ROLL_DEG[index]);
         }
- 
+
+        void setRectilinearIntrinsics(double fx, double fy, double cx, double cy) {
+            if (rectFx == fx && rectFy == fy && rectCx == cx && rectCy == cy) {
+                return;
+            }
+            rectFx = fx;
+            rectFy = fy;
+            rectCx = cx;
+            rectCy = cy;
+            cachedSrcW = -1;
+        }
+
         void project(Mat src, Mat dst) {
             if (src == null || src.empty()) {
                 return;
@@ -287,10 +325,14 @@ private static final double FISHEYE_CY = 0.50;
             if (map1 != null && srcW == cachedSrcW && srcH == cachedSrcH) {
                 return;
             }
-            double f = fisheyeFocal(srcW, srcH, INPUT_FISHEYE_FOV_DEG);
-double cx = srcW * FISHEYE_CX;
-double cy = srcH * FISHEYE_CY;
-double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
+            if (rectFx <= 0) {
+                throw new IllegalStateException("Rectilinear intrinsics not set for camera " + index);
+            }
+            double fx = rectFx;
+            double fy = rectFy;
+            double cx = rectCx;
+            double cy = rectCy;
+            double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
             double yaw0 = Math.toRadians(CAM_YAW_DEG[index]);
             double yawSpan = Math.toRadians(PANEL_YAW_DEG);
             double pitchSpan = Math.toRadians(PANEL_PITCH_DEG);
@@ -327,10 +369,8 @@ double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
                         rowY[u] = -1f;
                         continue;
                     }
-                    double r = fisheyeRadius(inc, f);
-                    double az = Math.atan2(yc, xc);
-                    float su = (float) (cx + r * Math.cos(az));
-                    float sv = (float) (cy + r * Math.sin(az));
+                    float su = (float) (fx * xc / zc + cx);
+                    float sv = (float) (fy * yc / zc + cy);
                     if (su < 1 || sv < 1 || su >= srcW - 1 || sv >= srcH - 1) {
                         rowX[u] = -1f;
                         rowY[u] = -1f;
@@ -411,16 +451,7 @@ double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
         return c;
     }
  
-    static double fisheyeFocal(int width, int height, double fovDeg) {
-        double half = Math.toRadians(fovDeg) / 2.0;
-        return (Math.min(width, height) / 2.0) / half;
-    }
- 
-    static double fisheyeRadius(double incidence, double focal) {
-    return focal * incidence; // pure equidistant, no distortion terms yet
-}
- 
-        static int panelOverlapPx() {
+    static int panelOverlapPx() {
         // MIN_BLEND_PX is now the actual seam width used, not just a floor —
         // this directly controls how wide the ghost/blend zone is.
         return Math.max(16, Math.min(PANEL_WIDTH / 3, MIN_BLEND_PX));
