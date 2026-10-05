@@ -1,0 +1,14 @@
+{
+  "projection": "EQUIDISTANT",
+  "fx": 406.46,
+  "fy": 406.46,
+  "cx": 627.9,
+  "cy": 531.2,
+  "fov_deg": 190.0,
+  "k1": 0.0,
+  "k2": 0.0,
+  "k3": 0.0,
+  "k4": 0.0,
+  "yaw_offset_deg": 0.0,
+  "pitch_offset_deg": 0.0
+}

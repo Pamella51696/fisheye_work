@@ -52,8 +52,9 @@ public class VideoStreamingServer {
  *  degrades near the rim, so this keeps panels out of the bad zone. */
 private static final double MAX_INCIDENCE_DEG = 78.0;
 /** Optical center as a fraction of image size; 0.5/0.5 = geometric center. */
-private static final double FISHEYE_CX = 0.50;
-private static final double FISHEYE_CY = 0.50;
+/** Fallback principal point if no {@code calib/<role>_fisheye.json} (from main-branch circle fit). */
+private static final double FISHEYE_CX = 0.509;
+private static final double FISHEYE_CY = 0.493;
     /** Only treat near-black remap holes as invalid (keep dark asphalt). */
     private static final double INVALID_LUMA = 3.0;
     /** Minimum seam width in pixels so feeds dissolve instead of overwriting. */
