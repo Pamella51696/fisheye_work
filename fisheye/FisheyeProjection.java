@@ -4,7 +4,7 @@ import java.util.Locale;
 
 /**
  * Ideal fisheye radius laws and named lens families used for direct ray→pixel mapping.
- * Kannala–Brandt is the default polynomial wrapper around the equidistant base.
+ * Equidistant is the default (AI / Blender fisheye); Kannala–Brandt adds k₁–k₄ on top.
  */
 public enum FisheyeProjection {
 
@@ -29,7 +29,7 @@ public enum FisheyeProjection {
 
     public static FisheyeProjection parse(String raw) {
         if (raw == null || raw.isBlank()) {
-            return KANNALA_BRANDT;
+            return EQUIDISTANT;
         }
         String k = raw.trim().toUpperCase(Locale.ROOT).replace('-', '_').replace(' ', '_');
         if (k.equals("KB") || k.equals("OPENCV_FISHEYE")) {
@@ -41,8 +41,8 @@ public enum FisheyeProjection {
         try {
             return valueOf(k);
         } catch (IllegalArgumentException e) {
-            System.err.println("Unknown fisheye projection '" + raw + "', using KANNALA_BRANDT");
-            return KANNALA_BRANDT;
+            System.err.println("Unknown fisheye projection '" + raw + "', using EQUIDISTANT");
+            return EQUIDISTANT;
         }
     }
 }

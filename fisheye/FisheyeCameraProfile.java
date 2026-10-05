@@ -23,7 +23,7 @@ public final class FisheyeCameraProfile {
                                             double defaultFovDeg,
                                             double cxFrac, double cyFrac) throws java.io.IOException {
         KannalaBrandtIntrinsics intrinsics;
-        FisheyeProjection projection = FisheyeProjection.KANNALA_BRANDT;
+        FisheyeProjection projection = FisheyeProjection.EQUIDISTANT;
         double xi = 0;
         double alpha = 0.5;
         double yawOff = 0;

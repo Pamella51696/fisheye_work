@@ -46,7 +46,7 @@ public class VideoStreamingServer {
     private static final double PANEL_YAW_DEG = 118.0;
     /** Vertical field around the horizon (deg). */
     private static final double PANEL_PITCH_DEG = 72.0;
-    /** Equidistant fisheye input FOV used to build K when no calib file exists. */
+    /** Equidistant fisheye FOV (r = f·θ); used when no calib file exists. */
     private static final double INPUT_FISHEYE_FOV_DEG = 190.0;
 /** Stop sampling past this angle from the lens axis — real fisheye glass
  *  degrades near the rim, so this keeps panels out of the bad zone. */
