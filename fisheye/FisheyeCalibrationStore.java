@@ -16,22 +16,33 @@ public final class FisheyeCalibrationStore {
     public static KannalaBrandtIntrinsics forCamera(String role, int width, int height,
                                                     double defaultFovDeg,
                                                     double cxFrac, double cyFrac) {
+        return loadProfile(role, width, height, defaultFovDeg, cxFrac, cyFrac).lens.intrinsics();
+    }
+
+    public static FisheyeCameraProfile loadProfile(String role, int width, int height,
+                                                   double defaultFovDeg,
+                                                   double cxFrac, double cyFrac) {
         Path calibDir = Paths.get("calib");
         Path json = calibDir.resolve(role + "_fisheye.json");
         Path props = calibDir.resolve(role + "_fisheye.properties");
         try {
             if (Files.isRegularFile(json)) {
-                return KannalaBrandtIntrinsics.load(json, width, height,
+                return FisheyeCameraProfile.load(json, width, height,
                         defaultFovDeg, cxFrac, cyFrac);
             }
             if (Files.isRegularFile(props)) {
-                return KannalaBrandtIntrinsics.load(props, width, height,
+                return FisheyeCameraProfile.load(props, width, height,
                         defaultFovDeg, cxFrac, cyFrac);
             }
         } catch (Exception e) {
             System.err.println("Could not load fisheye calib for " + role + ": " + e.getMessage()
                     + " — using FOV defaults.");
         }
-        return KannalaBrandtIntrinsics.fromFov(width, height, defaultFovDeg, cxFrac, cyFrac);
+        try {
+            return FisheyeCameraProfile.load(null, width, height,
+                    defaultFovDeg, cxFrac, cyFrac);
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException(e);
+        }
     }
 }

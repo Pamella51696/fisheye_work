@@ -76,15 +76,34 @@ public final class KannalaBrandtIntrinsics {
         return new KannalaBrandtIntrinsics(fx, fy, cx, cy, k1, k2, k3, k4);
     }
 
-    private static double num(String text, String key, double fallback) {
+    static double readNumber(String text, String key, double fallback) {
         Pattern p = Pattern.compile(
                 "\"?" + key + "\"?\\s*[:=]\\s*([-+]?\\d*\\.?\\d+(?:[eE][-+]?\\d+)?)",
                 Pattern.CASE_INSENSITIVE);
         Matcher m = p.matcher(text);
         if (m.find()) {
-            return Double.parseDouble(m.group(2));
+            return Double.parseDouble(m.group(1));
         }
         return fallback;
+    }
+
+    static String readString(String text, String key) {
+        Pattern p = Pattern.compile(
+                "\"?" + key + "\"?\\s*[:=]\\s*\"([^\"]+)\"",
+                Pattern.CASE_INSENSITIVE);
+        Matcher m = p.matcher(text);
+        if (m.find()) {
+            return m.group(1);
+        }
+        Pattern bare = Pattern.compile(
+                "\"?" + key + "\"?\\s*[:=]\\s*([A-Za-z_]+)",
+                Pattern.CASE_INSENSITIVE);
+        Matcher m2 = bare.matcher(text);
+        return m2.find() ? m2.group(1) : null;
+    }
+
+    private static double num(String text, String key, double fallback) {
+        return readNumber(text, key, fallback);
     }
 
     /** θ with KB radial factor (OpenCV fisheye θ_d). */

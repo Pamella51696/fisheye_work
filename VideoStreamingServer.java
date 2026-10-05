@@ -22,12 +22,13 @@ import org.opencv.videoio.VideoCapture;
 import org.opencv.videoio.Videoio;
 
 import fisheye.FisheyeCalibrationStore;
-import fisheye.FisheyeUndistortion;
+import fisheye.FisheyeCameraProfile;
+import fisheye.FisheyeLensModel;
  
 /**
  * Multi-camera panoramic projection with a shared vehicle-frame horizon.
  *
- *   fisheye pixels → Kannala–Brandt undistort → rectilinear → 3D rays
+ *   fisheye pixels → lens model (KB / equisolid / Mei / …) → 3D rays
  *        → R_camera (extrinsics) → common vehicle frame
  *        → spherical (θ, φ) → LEFT | FRONT | RIGHT | REAR canvas → feather
  *
@@ -181,7 +182,7 @@ private static final double FISHEYE_CY = 0.50;
             }
  
             SphericalPanel[] panels = new SphericalPanel[videoFiles.length];
-            FisheyeUndistortion[] undistort = new FisheyeUndistortion[videoFiles.length];
+            FisheyeCameraProfile[] profiles = new FisheyeCameraProfile[videoFiles.length];
             for (int i = 0; i < panels.length; i++) {
                 panels[i] = new SphericalPanel(i);
             }
@@ -193,11 +194,9 @@ private static final double FISHEYE_CY = 0.50;
  
             try (OutputStream out = ex.getResponseBody()) {
                 Mat[] frames = new Mat[videoFiles.length];
-                Mat[] rect   = new Mat[videoFiles.length];
                 Mat[] ready  = new Mat[videoFiles.length];
                 for (int i = 0; i < videoFiles.length; i++) {
                     frames[i] = new Mat();
-                    rect[i]   = new Mat();
                     ready[i]  = new Mat();
                 }
 
@@ -208,23 +207,21 @@ private static final double FISHEYE_CY = 0.50;
                             allReady = false;
                             continue;
                         }
-                        if (undistort[i] == null) {
-                            undistort[i] = new FisheyeUndistortion(
-                                    FisheyeCalibrationStore.forCamera(
-                                            CAM_ROLE[i],
-                                            frames[i].cols(),
-                                            frames[i].rows(),
-                                            INPUT_FISHEYE_FOV_DEG,
-                                            FISHEYE_CX,
-                                            FISHEYE_CY));
-                            panels[i].setRectilinearIntrinsics(
-                                    undistort[i].rectFx(),
-                                    undistort[i].rectFy(),
-                                    undistort[i].rectCx(),
-                                    undistort[i].rectCy());
+                        if (profiles[i] == null) {
+                            profiles[i] = FisheyeCalibrationStore.loadProfile(
+                                    CAM_ROLE[i],
+                                    frames[i].cols(),
+                                    frames[i].rows(),
+                                    INPUT_FISHEYE_FOV_DEG,
+                                    FISHEYE_CX,
+                                    FISHEYE_CY);
+                            panels[i].applyProfile(profiles[i]);
+                            System.out.println("  lens " + CAM_ROLE[i] + " → "
+                                    + profiles[i].lens.projection()
+                                    + " fx=" + profiles[i].lens.intrinsics().fx
+                                    + " yawΔ=" + profiles[i].yawOffsetDeg);
                         }
-                        undistort[i].undistort(frames[i], rect[i]);
-                        panels[i].project(rect[i], ready[i]);
+                        panels[i].project(frames[i], ready[i]);
                         if (ready[i].empty()
                                 || ready[i].cols() != PANEL_WIDTH
                                 || ready[i].rows() != PANEL_HEIGHT) {
@@ -281,35 +278,32 @@ private static final double FISHEYE_CY = 0.50;
  
     /**
      * One surround camera: spherical dest pixels are inverse-projected through
-     * the vehicle frame and pinhole intrinsics into the undistorted frame.
+     * the vehicle frame and the configured fisheye lens into the raw frame.
      */
     static final class SphericalPanel {
         private final int index;
-        private final double[] R; // camera-to-vehicle, row-major
-        private double rectFx = -1;
-        private double rectFy = -1;
-        private double rectCx;
-        private double rectCy;
+        private double[] R; // camera-to-vehicle, row-major
+        private FisheyeLensModel lens;
+        private final double[] uv = new double[2];
         private Mat map1;
         private Mat map2;
         private int cachedSrcW = -1;
         private int cachedSrcH = -1;
- 
+
         SphericalPanel(int index) {
             this.index = index;
-            this.R = cameraToVehicle(CAM_YAW_DEG[index],
-                    CAM_PITCH_DEG[index], CAM_ROLL_DEG[index]);
+            rebuildRotation(0, 0);
         }
 
-        void setRectilinearIntrinsics(double fx, double fy, double cx, double cy) {
-            if (rectFx == fx && rectFy == fy && rectCx == cx && rectCy == cy) {
-                return;
-            }
-            rectFx = fx;
-            rectFy = fy;
-            rectCx = cx;
-            rectCy = cy;
+        void applyProfile(FisheyeCameraProfile profile) {
+            this.lens = profile.lens;
+            rebuildRotation(profile.yawOffsetDeg, profile.pitchOffsetDeg);
             cachedSrcW = -1;
+        }
+
+        private void rebuildRotation(double yawOffDeg, double pitchOffDeg) {
+            this.R = cameraToVehicle(CAM_YAW_DEG[index] + yawOffDeg,
+                    CAM_PITCH_DEG[index] + pitchOffDeg, CAM_ROLL_DEG[index]);
         }
 
         void project(Mat src, Mat dst) {
@@ -325,13 +319,9 @@ private static final double FISHEYE_CY = 0.50;
             if (map1 != null && srcW == cachedSrcW && srcH == cachedSrcH) {
                 return;
             }
-            if (rectFx <= 0) {
-                throw new IllegalStateException("Rectilinear intrinsics not set for camera " + index);
+            if (lens == null) {
+                throw new IllegalStateException("Fisheye lens not set for camera " + index);
             }
-            double fx = rectFx;
-            double fy = rectFy;
-            double cx = rectCx;
-            double cy = rectCy;
             double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
             double yaw0 = Math.toRadians(CAM_YAW_DEG[index]);
             double yawSpan = Math.toRadians(PANEL_YAW_DEG);
@@ -369,8 +359,14 @@ private static final double FISHEYE_CY = 0.50;
                         rowY[u] = -1f;
                         continue;
                     }
-                    float su = (float) (fx * xc / zc + cx);
-                    float sv = (float) (fy * yc / zc + cy);
+                    lens.rayToPixel(xc, yc, zc, uv);
+                    float su = (float) uv[0];
+                    float sv = (float) uv[1];
+                    if (su < 0 || sv < 0) {
+                        rowX[u] = -1f;
+                        rowY[u] = -1f;
+                        continue;
+                    }
                     if (su < 1 || sv < 1 || su >= srcW - 1 || sv >= srcH - 1) {
                         rowX[u] = -1f;
                         rowY[u] = -1f;
