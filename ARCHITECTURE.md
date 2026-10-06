@@ -40,3 +40,20 @@ Stitching never goes through rectilinear images.
 ```
 
 Place `left_1.mp4`, `front_1.mp4`, `right_1.mp4`, `rear_1.mp4` in the repo root (as on `main`).
+<<<<<<< HEAD
+=======
+
+## Curb perception (this branch)
+
+Optional layer on rectified fisheye feeds — see **`CURB_ARCHITECTURE.md`**.
+
+```
+Fisheye → rectify → curb detect/track → vehicle distance → GREEN/YELLOW/RED → JSON API
+```
+
+Config: `config/curb.json`. Endpoints: `/api/curb`, `/api/curb/<role>`.
+
+## Build / run
+
+See **`BUILD.md`**. On Windows use `scripts\compile.bat` then `scripts\run.bat` so `surround/**` classes are on the classpath.
+>>>>>>> 9ef2ef3 (Add Windows build scripts and document full classpath compile)
