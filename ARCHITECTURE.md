@@ -20,7 +20,9 @@ Parallel path: Fisheye → RectilinearMapper → corrected feed (/corrected/<rol
 
 Stitching never goes through rectilinear images.
 
-**Ground plane:** experimental only — keep `ground_plane_enabled: 0` for AI fisheye (panel ground warp smears). Spherical rays + feather blend is the stable path.
+**Ground plane:** keep `ground_plane_enabled: 0` (panel ground warp smears AI feeds).
+
+**Partial undistort for stitch:** `partial_undistort_for_stitch: 1` with `stitch_undistort_balance` (~0.35–0.45) straightens bend before panorama mapping; increase balance for straighter lines, decrease to keep more fisheye FOV.
 
 ## Layout
 

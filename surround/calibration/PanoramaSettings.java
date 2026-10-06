@@ -17,6 +17,11 @@ public final class PanoramaSettings {
     public final double groundDistanceNear;
     public final double groundDistanceFar;
     public final int groundBlendRows;
+    /** Mild rectilinear undistort before stitch (reduces bend; keeps most FOV). */
+    public final boolean partialUndistortForStitch;
+    /** 0 = keep fisheye FOV, 1 = straighter lines (OpenCV balance analogue). */
+    public final double stitchUndistortBalance;
+    public final double stitchRectFovDeg;
 
     public PanoramaSettings(int panelWidth, int panelHeight,
                             double panelYawDeg, double panelPitchDeg,
@@ -25,7 +30,10 @@ public final class PanoramaSettings {
                             boolean groundPlaneEnabled,
                             double cameraHeightZ, double groundPlaneZ,
                             double groundDistanceNear, double groundDistanceFar,
-                            int groundBlendRows) {
+                            int groundBlendRows,
+                            boolean partialUndistortForStitch,
+                            double stitchUndistortBalance,
+                            double stitchRectFovDeg) {
         this.panelWidth = panelWidth;
         this.panelHeight = panelHeight;
         this.panelYawDeg = panelYawDeg;
@@ -40,5 +48,8 @@ public final class PanoramaSettings {
         this.groundDistanceNear = groundDistanceNear;
         this.groundDistanceFar = groundDistanceFar;
         this.groundBlendRows = groundBlendRows;
+        this.partialUndistortForStitch = partialUndistortForStitch;
+        this.stitchUndistortBalance = stitchUndistortBalance;
+        this.stitchRectFovDeg = stitchRectFovDeg;
     }
 }

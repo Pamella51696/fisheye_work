@@ -10,6 +10,7 @@ import surround.calibration.CameraConfig;
 import surround.calibration.PanoramaSettings;
 import surround.geometry.FisheyeRay;
 import surround.geometry.PoseMath;
+import surround.undistort.RectilinearSampling;
 
 /**
  * Precomputed map: panorama panel pixel → fisheye source via vehicle spherical rays.
@@ -20,6 +21,7 @@ public final class PanoramaMapper {
 
     private final CameraConfig camera;
     private final PanoramaSettings pano;
+    private final RectilinearSampling rectilinear;
     private final double[] R;
     private final double[] uv = new double[2];
     private Mat map1;
@@ -28,8 +30,14 @@ public final class PanoramaMapper {
     private int cachedH = -1;
 
     public PanoramaMapper(CameraConfig camera, PanoramaSettings pano) {
+        this(camera, pano, null);
+    }
+
+    /** @param rectilinear non-null when the source frame is mildly undistorted rectilinear. */
+    public PanoramaMapper(CameraConfig camera, PanoramaSettings pano, RectilinearSampling rectilinear) {
         this.camera = camera;
         this.pano = pano;
+        this.rectilinear = rectilinear;
         this.R = PoseMath.cameraToVehicle(
                 camera.extrinsics.effectiveYawDeg(),
                 camera.extrinsics.effectivePitchDeg(),
@@ -85,9 +93,16 @@ public final class PanoramaMapper {
                     rowY[u] = -1f;
                     continue;
                 }
-                FisheyeRay.rayToPixel(xc, yc, zc, camera.intrinsics, uv);
-                float su = (float) uv[0];
-                float sv = (float) uv[1];
+                float su;
+                float sv;
+                if (rectilinear != null) {
+                    su = (float) (rectilinear.fx * xc / zc + rectilinear.cx);
+                    sv = (float) (rectilinear.fy * yc / zc + rectilinear.cy);
+                } else {
+                    FisheyeRay.rayToPixel(xc, yc, zc, camera.intrinsics, uv);
+                    su = (float) uv[0];
+                    sv = (float) uv[1];
+                }
                 if (su < 1 || sv < 1 || su >= srcW - 1 || sv >= srcH - 1) {
                     rowX[u] = -1f;
                     rowY[u] = -1f;

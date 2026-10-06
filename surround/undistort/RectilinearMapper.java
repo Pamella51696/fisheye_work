@@ -29,6 +29,14 @@ public final class RectilinearMapper {
         this.outputFovDeg = outputFovDeg;
     }
 
+    public RectilinearSampling samplingForSize(int outW, int outH) {
+        ensureMaps(outW, outH);
+        double half = Math.toRadians(outputFovDeg) / 2.0;
+        double fMin = (Math.min(outW, outH) / 2.0) / half;
+        double fRect = fMin * (1.0 - balance) + intrinsics.fx * balance;
+        return new RectilinearSampling(fRect, fRect, outW / 2.0, outH / 2.0);
+    }
+
     public void rectify(Mat fisheyeBgr, Mat rectBgr) {
         if (fisheyeBgr == null || fisheyeBgr.empty()) {
             return;

@@ -20,6 +20,9 @@ panorama:
   ground_distance_near: 0.35
   ground_distance_far: 12.0
   ground_blend_rows: 28
+  partial_undistort_for_stitch: 1
+  stitch_undistort_balance: 0.38
+  stitch_rect_fov_deg: 102
 
 cameras:
   front:

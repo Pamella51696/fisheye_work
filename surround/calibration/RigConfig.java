@@ -56,7 +56,11 @@ public final class RigConfig {
                 JsonUtil.asDouble(pano, "ground_plane_z", 0.0),
                 JsonUtil.asDouble(pano, "ground_distance_near", 0.35),
                 JsonUtil.asDouble(pano, "ground_distance_far", 12.0),
-                (int) JsonUtil.asDouble(pano, "ground_blend_rows", 28));
+                (int) JsonUtil.asDouble(pano, "ground_blend_rows", 28),
+                pano.containsKey("partial_undistort_for_stitch")
+                        && JsonUtil.asDouble(pano.get("partial_undistort_for_stitch")) != 0,
+                JsonUtil.asDouble(pano, "stitch_undistort_balance", 0.38),
+                JsonUtil.asDouble(pano, "stitch_rect_fov_deg", 102.0));
         Map<String, Object> cams = JsonUtil.asObject(root.get("cameras"));
         List<CameraConfig> cameras = new ArrayList<>();
         for (String role : order) {
