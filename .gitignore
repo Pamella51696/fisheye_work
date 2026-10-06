@@ -1,0 +1,7 @@
+/.opencv/
+/build/
+*.class
+left.mp4
+front.mp4
+right.mp4
+rear.mp4

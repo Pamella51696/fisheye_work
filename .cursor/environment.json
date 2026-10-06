@@ -1,0 +1,17 @@
+{
+  "name": "fisheye_work",
+  "install": "bash .cursor/scripts/install.sh",
+  "start": "bash .cursor/scripts/start-server.sh",
+  "terminals": [
+    {
+      "name": "panorama-server",
+      "command": "java -Djava.library.path=/usr/lib/jni -cp build:/usr/share/java/opencv.jar VideoStreamingServer"
+    }
+  ],
+  "ports": [
+    {
+      "name": "panorama-ui",
+      "port": 9090
+    }
+  ]
+}

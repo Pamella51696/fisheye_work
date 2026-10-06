@@ -721,11 +721,17 @@ double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
  
     static VideoCapture openVideo(Path path) {
         String file = path.toAbsolutePath().toString();
-        int[] apis = { Videoio.CAP_FFMPEG, Videoio.CAP_ANY, Videoio.CAP_MSMF };
-        String[] labels = { "FFMPEG", "ANY", "MSMF" };
+        int[] apis = { Videoio.CAP_FFMPEG, Videoio.CAP_ANY };
+        String[] labels = { "FFMPEG", "ANY" };
         for (int a = 0; a < apis.length; a++) {
-            for (double convert : new double[]{ (apis[a] == Videoio.CAP_MSMF ? 0 : 1), 0, 1 }) {
-                VideoCapture cap = tryOpen(file, apis[a], labels[a], convert);
+            VideoCapture simple = tryOpenSimple(file, apis[a], labels[a]);
+            if (simple != null) {
+                return simple;
+            }
+        }
+        if (File.separatorChar == '\\') {
+            for (double convert : new double[] { 0, 1 }) {
+                VideoCapture cap = tryOpen(file, Videoio.CAP_MSMF, "MSMF", convert);
                 if (cap != null) {
                     return cap;
                 }
@@ -734,7 +740,10 @@ double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
         VideoCapture cap = new VideoCapture();
         cap.open(file);
         if (cap.isOpened()) {
-            cap.set(Videoio.CAP_PROP_CONVERT_RGB, 0);
+            try {
+                cap.set(Videoio.CAP_PROP_CONVERT_RGB, 0);
+            } catch (Exception ignored) {
+            }
             if (probeFrame(cap)) {
                 logBackend(file, cap, "default");
                 return cap;
@@ -742,6 +751,25 @@ double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
         }
         cap.release();
         return null;
+    }
+
+    static VideoCapture tryOpenSimple(String file, int api, String label) {
+        VideoCapture cap = new VideoCapture();
+        try {
+            if (!cap.open(file, api) || !cap.isOpened()) {
+                cap.release();
+                return null;
+            }
+        } catch (Exception e) {
+            cap.release();
+            return null;
+        }
+        if (!probeFrame(cap)) {
+            cap.release();
+            return null;
+        }
+        logBackend(file, cap, label);
+        return cap;
     }
  
     static VideoCapture tryOpen(String file, int api, String label, double convertRgb) {
@@ -760,7 +788,10 @@ double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
             return null;
         }
         params.release();
-        cap.set(Videoio.CAP_PROP_CONVERT_RGB, convertRgb);
+        try {
+            cap.set(Videoio.CAP_PROP_CONVERT_RGB, convertRgb);
+        } catch (Exception ignored) {
+        }
         if (!probeFrame(cap)) {
             cap.release();
             return null;
