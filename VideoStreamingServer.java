@@ -29,6 +29,11 @@ import org.opencv.videoio.Videoio;
  *
  * Horizon is φ = 0 in the vehicle frame (pose), not an image-space shift.
  * Clips are discovered in the working folder (left / front / right / rear).
+ *
+ * Chessboard calibration is backend-only (no UI):
+ *   java VideoStreamingServer --calibrate [--pattern 9x6] [--square 30mm]
+ * Production loads calib/&lt;role&gt;.json when present; otherwise the
+ * equidistant FOV model is used. Maps are built once, then remap() per frame.
  */
 public class VideoStreamingServer {
  
@@ -42,13 +47,13 @@ public class VideoStreamingServer {
     /** Vertical field around the horizon (deg). */
     private static final double PANEL_PITCH_DEG = 72.0;
     /** Equidistant fisheye input FOV used to build K when no calib file exists. */
-    private static final double INPUT_FISHEYE_FOV_DEG = 190.0;
+    static final double INPUT_FISHEYE_FOV_DEG = 190.0;
 /** Stop sampling past this angle from the lens axis — real fisheye glass
  *  degrades near the rim, so this keeps panels out of the bad zone. */
 private static final double MAX_INCIDENCE_DEG = 78.0;
 /** Optical center as a fraction of image size; 0.5/0.5 = geometric center. */
-private static final double FISHEYE_CX = 0.50;
-private static final double FISHEYE_CY = 0.50;
+    static final double FISHEYE_CX = 0.50;
+    static final double FISHEYE_CY = 0.50;
     /** Only treat near-black remap holes as invalid (keep dark asphalt). */
     private static final double INVALID_LUMA = 3.0;
     /** Minimum seam width in pixels so feeds dissolve instead of overwriting. */
@@ -57,29 +62,13 @@ private static final double FISHEYE_CY = 0.50;
     private static final int EDGE_FEATHER_PX = 100;
  
     /** Vehicle yaw of each camera, Left → Front → Right → Rear. */
-    private static final double[] CAM_YAW_DEG   = { -90.0, 0.0, 90.0, 180.0 };
+    static final double[] CAM_YAW_DEG   = { -90.0, 0.0, 90.0, 180.0 };
     /** Pitch: negative looks toward the ground (typical bumper / wing mount). */
-    private static final double[] CAM_PITCH_DEG = { -14.0, -12.0, -14.0, -21.0 };
-    private static final double[] CAM_ROLL_DEG  = {  0.0,  0.0,  0.0,   0.0 };
-    private static final String[] CAM_ROLE      = { "left", "front", "right", "rear" };
+    static final double[] CAM_PITCH_DEG = { -14.0, -12.0, -14.0, -21.0 };
+    static final double[] CAM_ROLL_DEG  = {  0.0,  0.0,  0.0,   0.0 };
+    static final String[] CAM_ROLE      = { "left", "front", "right", "rear" };
  
     public static void main(String[] args) throws IOException {
-        int port = DEFAULT_PORT;
-        if (args.length >= 1) {
-            try {
-                port = Integer.parseInt(args[0]);
-            } catch (NumberFormatException e) {
-                System.err.println("First argument must be a port number, got: " + args[0]);
-                return;
-            }
-        }
- 
-        Path folder = Paths.get(".").toAbsolutePath().normalize();
-        Path[] videos = discoverClips(folder);
-        if (videos == null) {
-            return;
-        }
- 
         try {
             System.loadLibrary(Core.NATIVE_LIBRARY_NAME);
         } catch (UnsatisfiedLinkError e) {
@@ -87,14 +76,45 @@ private static final double FISHEYE_CY = 0.50;
             return;
         }
         loadFfmpegPlugin();
- 
+
+        if (CalibrationManager.isCalibrateArgs(args)) {
+            CalibrationManager.Options opt;
+            try {
+                opt = CalibrationManager.parseArgs(args);
+            } catch (RuntimeException e) {
+                System.err.println(e.getMessage());
+                return;
+            }
+            int code = CalibrationManager.run(opt);
+            if (code != 0) {
+                System.exit(code);
+            }
+            return;
+        }
+
+        int port = DEFAULT_PORT;
+        Integer parsedPort = CalibrationManager.parsePort(args);
+        if (parsedPort != null) {
+            port = parsedPort;
+        } else if (args.length >= 1 && !args[0].startsWith("-")) {
+            System.err.println("First argument must be a port number or --calibrate, got: " + args[0]);
+            return;
+        }
+
+        Path folder = Paths.get(".").toAbsolutePath().normalize();
+        Path[] videos = discoverClips(folder);
+        if (videos == null) {
+            return;
+        }
+
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/stitch", new StitchHandler(videos));
         server.createContext("/play",   new PlayerPageHandler());
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
- 
+
         System.out.println("Server started  ->  http://localhost:" + port + "/play");
+        CalibrationManager.logLoadedModels();
         for (int i = 0; i < CAM_ROLE.length; i++) {
             System.out.println("  " + CAM_ROLE[i] + " = " + videos[i]
                     + "  yaw=" + CAM_YAW_DEG[i]
@@ -263,6 +283,7 @@ private static final double FISHEYE_CY = 0.50;
     static final class SphericalPanel {
         private final int index;
         private final double[] R; // camera-to-vehicle, row-major
+        private final CalibrationManager.CameraModel calib;
         private Mat map1;
         private Mat map2;
         private int cachedSrcW = -1;
@@ -270,8 +291,16 @@ private static final double FISHEYE_CY = 0.50;
  
         SphericalPanel(int index) {
             this.index = index;
-            this.R = cameraToVehicle(CAM_YAW_DEG[index],
-                    CAM_PITCH_DEG[index], CAM_ROLL_DEG[index]);
+            this.calib = CalibrationManager.load(CAM_ROLE[index]);
+            double yaw = CAM_YAW_DEG[index];
+            double pitch = CAM_PITCH_DEG[index];
+            double roll = CAM_ROLL_DEG[index];
+            if (this.calib != null && this.calib.hasExtrinsics) {
+                yaw = this.calib.yawDeg;
+                pitch = this.calib.pitchDeg;
+                roll = this.calib.rollDeg;
+            }
+            this.R = cameraToVehicle(yaw, pitch, roll);
         }
  
         void project(Mat src, Mat dst) {
@@ -287,10 +316,18 @@ private static final double FISHEYE_CY = 0.50;
             if (map1 != null && srcW == cachedSrcW && srcH == cachedSrcH) {
                 return;
             }
+            boolean useCalib = calib != null && calib.hasIntrinsics;
             double f = fisheyeFocal(srcW, srcH, INPUT_FISHEYE_FOV_DEG);
-double cx = srcW * FISHEYE_CX;
-double cy = srcH * FISHEYE_CY;
-double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
+            double[] K = useCalib
+                    ? calib.scaledK(srcW, srcH)
+                    : new double[] { f, f, srcW * FISHEYE_CX, srcH * FISHEYE_CY };
+            double k1 = useCalib ? calib.k1 : 0.0;
+            double k2 = useCalib ? calib.k2 : 0.0;
+            double k3 = useCalib ? calib.k3 : 0.0;
+            double k4 = useCalib ? calib.k4 : 0.0;
+            double cx = K[2];
+            double cy = K[3];
+            double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
             double yaw0 = Math.toRadians(CAM_YAW_DEG[index]);
             double yawSpan = Math.toRadians(PANEL_YAW_DEG);
             double pitchSpan = Math.toRadians(PANEL_PITCH_DEG);
@@ -327,10 +364,24 @@ double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
                         rowY[u] = -1f;
                         continue;
                     }
-                    double r = fisheyeRadius(inc, f);
-                    double az = Math.atan2(yc, xc);
-                    float su = (float) (cx + r * Math.cos(az));
-                    float sv = (float) (cy + r * Math.sin(az));
+                    float su;
+                    float sv;
+                    if (useCalib) {
+                        float[] uv = CalibrationManager.projectFisheye(
+                                xc, yc, zc, K, k1, k2, k3, k4);
+                        if (uv == null) {
+                            rowX[u] = -1f;
+                            rowY[u] = -1f;
+                            continue;
+                        }
+                        su = uv[0];
+                        sv = uv[1];
+                    } else {
+                        double r = fisheyeRadius(inc, f);
+                        double az = Math.atan2(yc, xc);
+                        su = (float) (cx + r * Math.cos(az));
+                        sv = (float) (cy + r * Math.sin(az));
+                    }
                     if (su < 1 || sv < 1 || su >= srcW - 1 || sv >= srcH - 1) {
                         rowX[u] = -1f;
                         rowY[u] = -1f;
