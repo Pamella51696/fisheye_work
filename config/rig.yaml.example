@@ -1,0 +1,37 @@
+# Parametric surround rig — copy to rig.json via calibration tools or edit JSON directly.
+# calibration_mode: synthetic | checkerboard (future)
+calibration_mode: synthetic
+description: Provisional AI-video fit; replace K,D,R,T when real camera arrives.
+
+camera_order: [left, front, right, rear]
+
+panorama:
+  panel_width: 640
+  panel_height: 400
+  panel_yaw_deg: 118
+  panel_pitch_deg: 72
+  horizon_fraction: 0.40
+  max_incidence_deg: 78
+  overlap_px: 34
+  edge_feather_px: 100
+
+cameras:
+  front:
+    model: EQUIDISTANT
+    width: 1280
+    height: 1080
+    fx: 432
+    fy: 432
+    cx: 629
+    cy: 513
+    k1: 0
+    k2: 0
+    k3: 0
+    k4: 0
+    yaw_deg: 0
+    pitch_deg: -12
+    roll_deg: 0
+    yaw_offset_deg: 0
+    pitch_offset_deg: 0
+    rect_balance: 0.0
+    rect_output_fov_deg: 90
