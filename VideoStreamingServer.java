@@ -21,6 +21,10 @@ import org.opencv.imgproc.Imgproc;
 import org.opencv.videoio.VideoCapture;
 import org.opencv.videoio.Videoio;
 
+import output.CurbDetectionResult;
+import output.CurbResultJson;
+import output.FusedCurbResult;
+import perception.curb.CurbPerceptionPipeline;
 import surround.runtime.SurroundPipeline;
  
 /**
@@ -34,6 +38,7 @@ public class VideoStreamingServer {
  
     private static final int DEFAULT_PORT = 9090;
     private static final Path RIG_CONFIG = Paths.get("config", "rig.json");
+    private static final Path CURB_CONFIG = Paths.get("config", "curb.json");
     private static final String[] CAM_ROLE = { "left", "front", "right", "rear" };
  
     public static void main(String[] args) throws IOException {
@@ -62,6 +67,7 @@ public class VideoStreamingServer {
         loadFfmpegPlugin();
 
         SurroundPipeline pipeline;
+        CurbPerceptionPipeline curbPipeline = null;
         try {
             pipeline = SurroundPipeline.load(RIG_CONFIG);
         } catch (IOException e) {
@@ -70,11 +76,25 @@ public class VideoStreamingServer {
             System.err.println(e.getMessage());
             return;
         }
+        try {
+            curbPipeline = new CurbPerceptionPipeline(
+                    configuration.CurbConfig.load(CURB_CONFIG), pipeline);
+            System.out.println("Curb perception enabled (" + CURB_CONFIG + ")");
+        } catch (IOException e) {
+            System.err.println("Curb config missing; /api/curb disabled: " + e.getMessage());
+        }
  
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/stitch", new StitchHandler(videos, pipeline));
         for (String role : CAM_ROLE) {
             server.createContext("/corrected/" + role, new CorrectedHandler(videos, pipeline, role));
+        }
+        if (curbPipeline != null) {
+            server.createContext("/api/curb", new CurbFusedHandler(videos, curbPipeline));
+            for (String role : CAM_ROLE) {
+                server.createContext("/api/curb/" + role,
+                        new CurbCameraHandler(videos, curbPipeline, role));
+            }
         }
         server.createContext("/play",   new PlayerPageHandler());
         server.setExecutor(Executors.newFixedThreadPool(4));
@@ -155,6 +175,102 @@ public class VideoStreamingServer {
             }
             streamMjpeg(ex, videoFiles, pipeline, false, -1);
         }
+    }
+
+    private static class CurbFusedHandler implements HttpHandler {
+        private final Path[] videoFiles;
+        private final CurbPerceptionPipeline curbPipeline;
+
+        CurbFusedHandler(Path[] f, CurbPerceptionPipeline curbPipeline) {
+            this.videoFiles = f;
+            this.curbPipeline = curbPipeline;
+        }
+
+        @Override public void handle(HttpExchange ex) throws IOException {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            streamCurbJson(ex, videoFiles, curbPipeline, null);
+        }
+    }
+
+    private static class CurbCameraHandler implements HttpHandler {
+        private final Path[] videoFiles;
+        private final CurbPerceptionPipeline curbPipeline;
+        private final String role;
+
+        CurbCameraHandler(Path[] f, CurbPerceptionPipeline curbPipeline, String role) {
+            this.videoFiles = f;
+            this.curbPipeline = curbPipeline;
+            this.role = role;
+        }
+
+        @Override public void handle(HttpExchange ex) throws IOException {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            streamCurbJson(ex, videoFiles, curbPipeline, role);
+        }
+    }
+
+    private static void streamCurbJson(HttpExchange ex, Path[] videoFiles,
+                                       CurbPerceptionPipeline curbPipeline,
+                                       String singleRole) throws IOException {
+        VideoCapture[] caps = new VideoCapture[videoFiles.length];
+        for (int i = 0; i < videoFiles.length; i++) {
+            caps[i] = openVideo(videoFiles[i]);
+            if (caps[i] == null || !caps[i].isOpened()) {
+                ex.sendResponseHeaders(500, -1);
+                return;
+            }
+        }
+        ex.getResponseHeaders().set("Content-Type", "application/x-ndjson; charset=UTF-8");
+        ex.sendResponseHeaders(200, 0);
+        try (OutputStream out = ex.getResponseBody()) {
+            Mat[] frames = new Mat[videoFiles.length];
+            for (int i = 0; i < videoFiles.length; i++) {
+                frames[i] = new Mat();
+            }
+            while (true) {
+                boolean allReady = true;
+                for (int i = 0; i < caps.length; i++) {
+                    if (!readOrLoop(caps, i, videoFiles[i], frames[i])) {
+                        allReady = false;
+                    }
+                }
+                if (!allReady) {
+                    continue;
+                }
+                long ts = System.currentTimeMillis();
+                FusedCurbResult fused = curbPipeline.process(frames, ts);
+                String line;
+                if (singleRole == null) {
+                    line = CurbResultJson.fusedToJson(fused);
+                } else {
+                    CurbDetectionResult cam = pickCamera(fused, singleRole);
+                    line = CurbResultJson.cameraToJson(cam);
+                }
+                out.write((line + "\n").getBytes("UTF-8"));
+                out.flush();
+            }
+        } finally {
+            for (VideoCapture c : caps) {
+                if (c != null) {
+                    c.release();
+                }
+            }
+        }
+    }
+
+    private static CurbDetectionResult pickCamera(FusedCurbResult fused, String role) {
+        for (CurbDetectionResult c : fused.perCamera) {
+            if (c.cameraId.equalsIgnoreCase(role)) {
+                return c;
+            }
+        }
+        return CurbDetectionResult.noDetection(fused.timestampMs, role);
     }
 
     private static class CorrectedHandler implements HttpHandler {

@@ -1,0 +1,11 @@
+{
+  "red_threshold_meters": 0.5,
+  "yellow_threshold_meters": 1.0,
+  "min_confidence": 0.5,
+  "tracking_smoothing": 0.65,
+  "zone_hysteresis_frames": 3,
+  "camera_height_z": 1.0,
+  "ground_plane_z": 0.0,
+  "max_detection_range_meters": 4.0,
+  "fusion_association_meters": 0.35
+}

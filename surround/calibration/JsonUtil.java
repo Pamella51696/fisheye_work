@@ -8,7 +8,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /** Minimal JSON parser for rig config (objects, arrays, numbers, strings). */
-final class JsonUtil {
+public final class JsonUtil {
 
     private JsonUtil() {
     }

@@ -40,3 +40,13 @@ Stitching never goes through rectilinear images.
 ```
 
 Place `left_1.mp4`, `front_1.mp4`, `right_1.mp4`, `rear_1.mp4` in the repo root (as on `main`).
+
+## Curb perception (this branch)
+
+Optional layer on rectified fisheye feeds — see **`CURB_ARCHITECTURE.md`**.
+
+```
+Fisheye → rectify → curb detect/track → vehicle distance → GREEN/YELLOW/RED → JSON API
+```
+
+Config: `config/curb.json`. Endpoints: `/api/curb`, `/api/curb/<role>`.
