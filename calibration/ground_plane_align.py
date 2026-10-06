@@ -141,7 +141,7 @@ def main():
     rig_path = root / "config" / "rig.json"
     rig = json.loads(rig_path.read_text())
     pano = rig["panorama"]
-    pano["ground_plane_enabled"] = 1
+    pano["ground_plane_enabled"] = 0
     pano.setdefault("camera_height_z", 1.0)
     pano.setdefault("ground_plane_z", 0.0)
     pano.setdefault("ground_distance_near", 0.35)
