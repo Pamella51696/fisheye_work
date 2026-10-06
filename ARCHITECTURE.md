@@ -50,3 +50,7 @@ Fisheye → rectify → curb detect/track → vehicle distance → GREEN/YELLOW/
 ```
 
 Config: `config/curb.json`. Endpoints: `/api/curb`, `/api/curb/<role>`.
+
+## Build / run
+
+See **`BUILD.md`**. On Windows use `scripts\compile.bat` then `scripts\run.bat` so `surround/**` classes are on the classpath.
