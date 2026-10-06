@@ -38,6 +38,11 @@ final class JsonUtil {
         return o.toString();
     }
 
+    static double asDouble(Map<String, Object> map, String key, double fallback) {
+        Object o = map.get(key);
+        return o == null ? fallback : asDouble(o);
+    }
+
     private static final class Parser {
         private final String s;
         private int i;

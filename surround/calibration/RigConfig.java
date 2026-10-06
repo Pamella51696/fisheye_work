@@ -40,6 +40,8 @@ public final class RigConfig {
             order.add(JsonUtil.asString(o));
         }
         Map<String, Object> pano = JsonUtil.asObject(root.get("panorama"));
+        boolean ground = pano.containsKey("ground_plane_enabled")
+                && JsonUtil.asDouble(pano.get("ground_plane_enabled")) != 0;
         PanoramaSettings panorama = new PanoramaSettings(
                 (int) JsonUtil.asDouble(pano.get("panel_width")),
                 (int) JsonUtil.asDouble(pano.get("panel_height")),
@@ -48,7 +50,13 @@ public final class RigConfig {
                 JsonUtil.asDouble(pano.get("horizon_fraction")),
                 JsonUtil.asDouble(pano.get("max_incidence_deg")),
                 (int) JsonUtil.asDouble(pano.get("overlap_px")),
-                (int) JsonUtil.asDouble(pano.get("edge_feather_px")));
+                (int) JsonUtil.asDouble(pano.get("edge_feather_px")),
+                ground,
+                JsonUtil.asDouble(pano, "camera_height_z", 1.0),
+                JsonUtil.asDouble(pano, "ground_plane_z", 0.0),
+                JsonUtil.asDouble(pano, "ground_distance_near", 0.35),
+                JsonUtil.asDouble(pano, "ground_distance_far", 12.0),
+                (int) JsonUtil.asDouble(pano, "ground_blend_rows", 28));
         Map<String, Object> cams = JsonUtil.asObject(root.get("cameras"));
         List<CameraConfig> cameras = new ArrayList<>();
         for (String role : order) {
@@ -66,7 +74,8 @@ public final class RigConfig {
                     JsonUtil.asDouble(c.get("k3")),
                     JsonUtil.asDouble(c.get("k4")),
                     JsonUtil.asDouble(c.get("rect_balance")),
-                    JsonUtil.asDouble(c.get("rect_output_fov_deg")));
+                    JsonUtil.asDouble(c.get("rect_output_fov_deg")),
+                    JsonUtil.asDouble(c, "focal_zoom_out", 1.0));
             CameraExtrinsics ext = new CameraExtrinsics(
                     JsonUtil.asDouble(c.get("yaw_deg")),
                     JsonUtil.asDouble(c.get("pitch_deg")),

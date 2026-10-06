@@ -9,10 +9,12 @@ import org.opencv.imgproc.Imgproc;
 import surround.calibration.CameraConfig;
 import surround.calibration.PanoramaSettings;
 import surround.geometry.FisheyeRay;
+import surround.geometry.GroundPlane;
 import surround.geometry.PoseMath;
 
 /**
- * Precomputed map: panorama panel pixel → fisheye source sample (ray-based path).
+ * Precomputed map: panorama panel pixel → fisheye source (vehicle ray → camera ray → pixel).
+ * Below the shared horizon, rays are anchored to a common ground plane when enabled.
  */
 public final class PanoramaMapper {
 
@@ -20,6 +22,9 @@ public final class PanoramaMapper {
     private final PanoramaSettings pano;
     private final double[] R;
     private final double[] uv = new double[2];
+    private final double[] rayV = new double[3];
+    private final double[] rayG = new double[3];
+    private final double[] rayS = new double[3];
     private Mat map1;
     private Mat map2;
     private int cachedW = -1;
@@ -54,6 +59,7 @@ public final class PanoramaMapper {
         double yawSpan = Math.toRadians(pano.panelYawDeg);
         double pitchSpan = Math.toRadians(pano.panelPitchDeg);
         double horizonY = pano.horizonFraction * ph;
+        int blend = pano.groundBlendRows;
 
         Mat mapX = new Mat(ph, pw, CvType.CV_32FC1);
         Mat mapY = new Mat(ph, pw, CvType.CV_32FC1);
@@ -62,16 +68,40 @@ public final class PanoramaMapper {
 
         for (int v = 0; v < ph; v++) {
             double phi = (horizonY - v) / ph * pitchSpan;
-            double cphi = Math.cos(phi);
-            double sphi = Math.sin(phi);
             for (int u = 0; u < pw; u++) {
                 double theta = yaw0 + ((u + 0.5) / pw - 0.5) * yawSpan;
-                double xv = cphi * Math.cos(theta);
-                double yv = cphi * Math.sin(theta);
-                double zv = sphi;
-                double xc = R[0] * xv + R[3] * yv + R[6] * zv;
-                double yc = R[1] * xv + R[4] * yv + R[7] * zv;
-                double zc = R[2] * xv + R[5] * yv + R[8] * zv;
+
+                if (pano.groundPlaneEnabled && v > horizonY - blend) {
+                    double groundFrac = (v - horizonY) / Math.max(1.0, ph - horizonY);
+                    if (groundFrac < 0) {
+                        groundFrac = 0;
+                    }
+                    if (groundFrac > 1) {
+                        groundFrac = 1;
+                    }
+                    double range = pano.groundDistanceNear
+                            + groundFrac * (pano.groundDistanceFar - pano.groundDistanceNear);
+                    GroundPlane.rayTowardGroundPoint(theta, range,
+                            pano.cameraHeightZ, pano.groundPlaneZ, rayG);
+                    GroundPlane.rayFromSpherical(theta, phi, rayS);
+                    double t = 1.0;
+                    if (v < horizonY + blend) {
+                        t = (v - (horizonY - blend)) / Math.max(1.0, 2.0 * blend);
+                        if (t < 0) {
+                            t = 0;
+                        }
+                        if (t > 1) {
+                            t = 1;
+                        }
+                    }
+                    GroundPlane.lerp3(rayS, rayG, t, rayV);
+                } else {
+                    GroundPlane.rayFromSpherical(theta, phi, rayV);
+                }
+
+                double xc = R[0] * rayV[0] + R[3] * rayV[1] + R[6] * rayV[2];
+                double yc = R[1] * rayV[0] + R[4] * rayV[1] + R[7] * rayV[2];
+                double zc = R[2] * rayV[0] + R[5] * rayV[1] + R[8] * rayV[2];
                 if (zc <= 1e-4) {
                     rowX[u] = -1f;
                     rowY[u] = -1f;

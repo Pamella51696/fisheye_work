@@ -15,11 +15,14 @@ public final class CameraIntrinsics {
     public final double k4;
     public final double rectBalance;
     public final double rectOutputFovDeg;
+    /** &gt;1 widens effective FOV (zoom out) when sampling the fisheye. */
+    public final double focalZoomOut;
 
     public CameraIntrinsics(String model, int width, int height,
                             double fx, double fy, double cx, double cy,
                             double k1, double k2, double k3, double k4,
-                            double rectBalance, double rectOutputFovDeg) {
+                            double rectBalance, double rectOutputFovDeg,
+                            double focalZoomOut) {
         this.model = model;
         this.width = width;
         this.height = height;
@@ -33,5 +36,6 @@ public final class CameraIntrinsics {
         this.k4 = k4;
         this.rectBalance = rectBalance;
         this.rectOutputFovDeg = rectOutputFovDeg;
+        this.focalZoomOut = focalZoomOut < 0.5 ? 0.5 : focalZoomOut;
     }
 }

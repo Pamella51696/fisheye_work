@@ -9,6 +9,9 @@ public final class FisheyeRay {
     }
 
     public static void rayToPixel(double x, double y, double z, CameraIntrinsics intr, double[] outUv) {
+        double zoom = intr.focalZoomOut;
+        double fx = intr.fx / zoom;
+        double fy = intr.fy / zoom;
         String model = intr.model == null ? "EQUIDISTANT" : intr.model.toUpperCase();
         double r = Math.hypot(x, y);
         double theta = Math.atan2(r, z);
@@ -30,8 +33,8 @@ public final class FisheyeRay {
                 break;
         }
         double s = r > 1e-10 ? thetaD / r : 0.0;
-        outUv[0] = intr.fx * x * s + intr.cx;
-        outUv[1] = intr.fy * y * s + intr.cy;
+        outUv[0] = fx * x * s + intr.cx;
+        outUv[1] = fy * y * s + intr.cy;
     }
 
     private static double thetaDistorted(double theta, CameraIntrinsics intr) {

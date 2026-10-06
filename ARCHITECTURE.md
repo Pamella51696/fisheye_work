@@ -20,6 +20,8 @@ Parallel path: Fisheye → RectilinearMapper → corrected feed (/corrected/<rol
 
 Stitching never goes through rectilinear images.
 
+**Ground plane:** rows below the shared horizon use rays to a common horizontal plane (`ground_plane_z`), with per-camera `focal_zoom_out` to widen FOV where needed. Tune via `calibration/ground_plane_align.py`.
+
 ## Layout
 
 - `surround/calibration/` — rig config loader
