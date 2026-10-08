@@ -19,6 +19,7 @@ public final class CurbDetectionService {
     private final CurbResultFilter filter;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private volatile CurbState state = CurbState.unavailable();
+    private volatile FusedCurbResult lastFused;
     private Thread worker;
 
     public CurbDetectionService(FrameDistributor distributor,
@@ -54,6 +55,11 @@ public final class CurbDetectionService {
         return filter;
     }
 
+    /** Latest full perception output (for dev debug overlay). */
+    public FusedCurbResult lastFusedResult() {
+        return lastFused;
+    }
+
     private void loop() {
         BlockingQueue<FrameSnapshot> queue = distributor.analyticsQueue();
         while (running.get()) {
@@ -64,6 +70,7 @@ public final class CurbDetectionService {
                     continue;
                 }
                 FusedCurbResult fused = pipeline.process(snap.fisheyeBgr, snap.timestampMs);
+                lastFused = fused;
                 state = filter.filter(fused);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
