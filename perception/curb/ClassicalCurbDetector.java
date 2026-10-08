@@ -17,7 +17,7 @@ public final class ClassicalCurbDetector implements CurbDetector {
 
     private static final int SAMPLE_COLUMNS = 24;
     private static final double ROI_TOP_FRACTION = 0.35;
-    private static final double MIN_GRADIENT = 18.0;
+    private static final double MIN_GRADIENT = 12.0;
 
     @Override
     public List<ImagePoint> detect(Mat rectilinearBgr, String role, double[] outConfidence) {

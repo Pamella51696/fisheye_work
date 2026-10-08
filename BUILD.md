@@ -22,6 +22,10 @@ scripts\run.bat
 Then open: http://localhost:9090/play
 
 Signals (curb + simulated steering): http://localhost:9090/api/signals  
+
+**Curb is not drawn on `/stitch`** (Android overlay). For local testing use:  
+http://localhost:9090/play (split view) or http://localhost:9090/debug/curb/right  
+
 Trigger a turn scenario: `POST http://localhost:9090/api/vehicle/simulate?scenario=RIGHT_TURN`
 
 If your jar is not named `opencv-490.jar`, adjust `OPENCV_DIR` or rename/copy the jar under `%OPENCV_DIR%\java\`.
