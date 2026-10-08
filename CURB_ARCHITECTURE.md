@@ -1,19 +1,31 @@
 # Curb-side detection (perception layer)
 
-Runs **on top of** the Kannala–Brandt / surround fisheye middleware. Video clips stay on `main` (`left_1.mp4`, …); runtime rig + curb config live on this branch.
+Runs **asynchronously** on top of the Kannala–Brandt / surround fisheye middleware.  
+**Video never waits on curb detection** — see `CameraCaptureManager` + `FrameDistributor`.
+
+## Domains
+
+| Domain | Responsibility |
+|--------|----------------|
+| **Video** | `CameraCaptureManager` → `SurroundPipeline` → `/stitch`, `/corrected/*` |
+| **Curb analytics** | `CurbDetectionService` (worker thread, capacity-1 frame queue) |
+| **Vehicle signals** | `UdpVehicleSignalService` + `VehicleSignalSimulator` (UDP later) |
+| **Android signals** | `SignalPublisher` → `/api/signals` |
 
 ## Pipeline
 
 ```
-Fisheye frame (per camera)
-    → SurroundPipeline.rectify()   (KB / equidistant → rectilinear)
-    → CurbDetector                 (classical CV today; ML-ready interface)
-    → CurbTracker                  (temporal smoothing)
-    → CoordinateTransform          (image → vehicle ground plane)
-    → CurbDistanceEstimator
-    → CurbZoneClassifier           (GREEN / YELLOW / RED, configurable meters)
-    → CurbFusion                   (four-camera vehicle frame)
-    → CurbDetectionResult / FusedCurbResult JSON  →  Android overlay (external)
+Fisheye frames (single capture)
+    → FrameDistributor ──┬──► video consumers (MJPEG)
+                         └──► analytics queue (latest only)
+                                    │
+                                    ▼
+                         CurbDetectionService
+                                    │
+                    rectify → detect → distance → zones → filter
+                                    │
+                                    ▼
+                              CurbState → /api/signals
 ```
 
 No overlay or UI instructions are emitted—only geometry, distance, zone, and confidence.
@@ -43,8 +55,13 @@ No overlay or UI instructions are emitted—only geometry, distance, zone, and c
 
 ## HTTP API (simulation server)
 
-- `GET /api/curb` — newline-delimited JSON (`FusedCurbResult` per frame)
-- `GET /api/curb/left|front|right|rear` — single-camera `CurbDetectionResult` stream
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/signals` | Latest unified JSON (`curb` + `vehicle`) |
+| `GET /api/signals/stream` | Filtered NDJSON (~10 Hz) |
+| `POST /api/vehicle/simulate?scenario=RIGHT_TURN` | Start steering scenario |
+
+Video remains on `/stitch` and `/corrected/<role>` (separate channel).
 
 ## Testing
 

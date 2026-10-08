@@ -21,6 +21,9 @@ scripts\run.bat
 
 Then open: http://localhost:9090/play
 
+Signals (curb + simulated steering): http://localhost:9090/api/signals  
+Trigger a turn scenario: `POST http://localhost:9090/api/vehicle/simulate?scenario=RIGHT_TURN`
+
 If your jar is not named `opencv-490.jar`, adjust `OPENCV_DIR` or rename/copy the jar under `%OPENCV_DIR%\java\`.
 
 ### Manual commands

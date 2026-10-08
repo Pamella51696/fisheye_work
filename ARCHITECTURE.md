@@ -49,7 +49,9 @@ Optional layer on rectified fisheye feeds — see **`CURB_ARCHITECTURE.md`**.
 Fisheye → rectify → curb detect/track → vehicle distance → GREEN/YELLOW/RED → JSON API
 ```
 
-Config: `config/curb.json`. Endpoints: `/api/curb`, `/api/curb/<role>`.
+Config: `config/curb.json`. Signals: `/api/signals` (curb + vehicle); video unchanged on `/stitch`.
+
+Async layout: `CameraCaptureManager` → `FrameDistributor` → video **and** `CurbDetectionService` (see `CURB_ARCHITECTURE.md`).
 
 ## Build / run
 

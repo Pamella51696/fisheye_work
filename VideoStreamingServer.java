@@ -13,6 +13,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.Executors;
  
 import org.opencv.core.*;
@@ -21,11 +22,18 @@ import org.opencv.imgproc.Imgproc;
 import org.opencv.videoio.VideoCapture;
 import org.opencv.videoio.Videoio;
 
-import output.CurbDetectionResult;
-import output.CurbResultJson;
-import output.FusedCurbResult;
+import configuration.CurbConfig;
 import perception.curb.CurbPerceptionPipeline;
+import surround.analytics.CurbDetectionService;
+import surround.analytics.CurbResultFilter;
+import surround.runtime.CameraCaptureManager;
+import surround.runtime.CameraIo;
+import surround.runtime.FrameDistributor;
+import surround.runtime.FrameSnapshot;
 import surround.runtime.SurroundPipeline;
+import surround.signal.SignalPublisher;
+import surround.vehicle.UdpVehicleSignalService;
+import surround.vehicle.VehicleSignalSimulator;
  
 /**
  * Multi-camera panoramic projection with a shared vehicle-frame horizon.
@@ -33,6 +41,7 @@ import surround.runtime.SurroundPipeline;
  * Ray-based surround pipeline (see {@code config/rig.json}).
  * Fisheye → camera model → 3D ray → vehicle frame → panorama → feather blend.
  * Rectilinear corrected feeds: {@code /corrected/<role>}.
+ * Curb + vehicle signals: {@code /api/signals} (async analytics, not in video loop).
  */
 public class VideoStreamingServer {
  
@@ -64,10 +73,9 @@ public class VideoStreamingServer {
             System.err.println("OpenCV native library not found: " + e.getMessage());
             return;
         }
-        loadFfmpegPlugin();
+        CameraIo.loadFfmpegPlugin();
 
         SurroundPipeline pipeline;
-        CurbPerceptionPipeline curbPipeline = null;
         try {
             pipeline = SurroundPipeline.load(RIG_CONFIG);
         } catch (IOException e) {
@@ -76,26 +84,42 @@ public class VideoStreamingServer {
             System.err.println(e.getMessage());
             return;
         }
+
+        FrameDistributor frameDistributor = new FrameDistributor();
+        CameraCaptureManager captureManager =
+                new CameraCaptureManager(videos, frameDistributor);
+        captureManager.start();
+
+        CurbDetectionService curbService = null;
+        SignalPublisher signalPublisher = null;
+        UdpVehicleSignalService vehicleService = new UdpVehicleSignalService(new VehicleSignalSimulator());
+        vehicleService.start();
         try {
-            curbPipeline = new CurbPerceptionPipeline(
-                    configuration.CurbConfig.load(CURB_CONFIG), pipeline);
-            System.out.println("Curb perception enabled (" + CURB_CONFIG + ")");
+            CurbConfig curbConfig = CurbConfig.load(CURB_CONFIG);
+            CurbPerceptionPipeline curbPipeline =
+                    new CurbPerceptionPipeline(curbConfig, pipeline);
+            CurbResultFilter filter = new CurbResultFilter(0.08, 500);
+            curbService = new CurbDetectionService(frameDistributor, curbPipeline, filter);
+            curbService.start();
+            signalPublisher = new SignalPublisher(curbService, vehicleService, 1.0);
+            System.out.println("Async curb analytics enabled (" + CURB_CONFIG + ")");
         } catch (IOException e) {
-            System.err.println("Curb config missing; /api/curb disabled: " + e.getMessage());
+            System.err.println("Curb config missing; curb signals UNAVAILABLE: " + e.getMessage());
+            signalPublisher = new SignalPublisher(null, vehicleService, 1.0);
         }
- 
+
+        final SignalPublisher signals = signalPublisher;
+        final UdpVehicleSignalService vehicle = vehicleService;
+
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.createContext("/stitch", new StitchHandler(videos, pipeline));
+        server.createContext("/stitch", new StitchHandler(pipeline, frameDistributor));
         for (String role : CAM_ROLE) {
-            server.createContext("/corrected/" + role, new CorrectedHandler(videos, pipeline, role));
+            server.createContext("/corrected/" + role,
+                    new CorrectedHandler(pipeline, frameDistributor, role));
         }
-        if (curbPipeline != null) {
-            server.createContext("/api/curb", new CurbFusedHandler(videos, curbPipeline));
-            for (String role : CAM_ROLE) {
-                server.createContext("/api/curb/" + role,
-                        new CurbCameraHandler(videos, curbPipeline, role));
-            }
-        }
+        server.createContext("/api/signals", new SignalsHandler(signals, false));
+        server.createContext("/api/signals/stream", new SignalsHandler(signals, true));
+        server.createContext("/api/vehicle/simulate", new VehicleSimulateHandler(vehicle));
         server.createContext("/play",   new PlayerPageHandler());
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
@@ -121,7 +145,7 @@ public class VideoStreamingServer {
                         + CAM_ROLE[i] + ".mp4)");
                 return null;
             }
-            found[i] = ensureDecodable(found[i]);
+            found[i] = CameraIo.ensureDecodable(found[i]);
         }
         return found;
     }
@@ -160,12 +184,12 @@ public class VideoStreamingServer {
     }
  
     private static class StitchHandler implements HttpHandler {
-        private final Path[] videoFiles;
         private final SurroundPipeline pipeline;
+        private final FrameDistributor distributor;
 
-        StitchHandler(Path[] f, SurroundPipeline pipeline) {
-            this.videoFiles = f;
+        StitchHandler(SurroundPipeline pipeline, FrameDistributor distributor) {
             this.pipeline = pipeline;
+            this.distributor = distributor;
         }
 
         @Override public void handle(HttpExchange ex) throws IOException {
@@ -173,17 +197,17 @@ public class VideoStreamingServer {
                 ex.sendResponseHeaders(405, -1);
                 return;
             }
-            streamMjpeg(ex, videoFiles, pipeline, false, -1);
+            streamMjpeg(ex, pipeline, distributor, false, -1);
         }
     }
 
-    private static class CurbFusedHandler implements HttpHandler {
-        private final Path[] videoFiles;
-        private final CurbPerceptionPipeline curbPipeline;
+    private static class SignalsHandler implements HttpHandler {
+        private final SignalPublisher publisher;
+        private final boolean stream;
 
-        CurbFusedHandler(Path[] f, CurbPerceptionPipeline curbPipeline) {
-            this.videoFiles = f;
-            this.curbPipeline = curbPipeline;
+        SignalsHandler(SignalPublisher publisher, boolean stream) {
+            this.publisher = publisher;
+            this.stream = stream;
         }
 
         @Override public void handle(HttpExchange ex) throws IOException {
@@ -191,96 +215,79 @@ public class VideoStreamingServer {
                 ex.sendResponseHeaders(405, -1);
                 return;
             }
-            streamCurbJson(ex, videoFiles, curbPipeline, null);
-        }
-    }
-
-    private static class CurbCameraHandler implements HttpHandler {
-        private final Path[] videoFiles;
-        private final CurbPerceptionPipeline curbPipeline;
-        private final String role;
-
-        CurbCameraHandler(Path[] f, CurbPerceptionPipeline curbPipeline, String role) {
-            this.videoFiles = f;
-            this.curbPipeline = curbPipeline;
-            this.role = role;
-        }
-
-        @Override public void handle(HttpExchange ex) throws IOException {
-            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
-                ex.sendResponseHeaders(405, -1);
-                return;
-            }
-            streamCurbJson(ex, videoFiles, curbPipeline, role);
-        }
-    }
-
-    private static void streamCurbJson(HttpExchange ex, Path[] videoFiles,
-                                       CurbPerceptionPipeline curbPipeline,
-                                       String singleRole) throws IOException {
-        VideoCapture[] caps = new VideoCapture[videoFiles.length];
-        for (int i = 0; i < videoFiles.length; i++) {
-            caps[i] = openVideo(videoFiles[i]);
-            if (caps[i] == null || !caps[i].isOpened()) {
-                ex.sendResponseHeaders(500, -1);
-                return;
-            }
-        }
-        ex.getResponseHeaders().set("Content-Type", "application/x-ndjson; charset=UTF-8");
-        ex.sendResponseHeaders(200, 0);
-        try (OutputStream out = ex.getResponseBody()) {
-            Mat[] frames = new Mat[videoFiles.length];
-            for (int i = 0; i < videoFiles.length; i++) {
-                frames[i] = new Mat();
-            }
-            while (true) {
-                boolean allReady = true;
-                for (int i = 0; i < caps.length; i++) {
-                    if (!readOrLoop(caps, i, videoFiles[i], frames[i])) {
-                        allReady = false;
+            if (stream) {
+                ex.getResponseHeaders().set("Content-Type", "application/x-ndjson; charset=UTF-8");
+                ex.sendResponseHeaders(200, 0);
+                try (OutputStream out = ex.getResponseBody()) {
+                    while (true) {
+                        String line = publisher.toJson();
+                        out.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        Thread.sleep(100);
                     }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 }
-                if (!allReady) {
-                    continue;
-                }
-                long ts = System.currentTimeMillis();
-                FusedCurbResult fused = curbPipeline.process(frames, ts);
-                String line;
-                if (singleRole == null) {
-                    line = CurbResultJson.fusedToJson(fused);
-                } else {
-                    CurbDetectionResult cam = pickCamera(fused, singleRole);
-                    line = CurbResultJson.cameraToJson(cam);
-                }
-                out.write((line + "\n").getBytes("UTF-8"));
-                out.flush();
-            }
-        } finally {
-            for (VideoCapture c : caps) {
-                if (c != null) {
-                    c.release();
+            } else {
+                byte[] bytes = publisher.toJson().getBytes(StandardCharsets.UTF_8);
+                ex.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+                ex.sendResponseHeaders(200, bytes.length);
+                try (OutputStream out = ex.getResponseBody()) {
+                    out.write(bytes);
                 }
             }
         }
     }
 
-    private static CurbDetectionResult pickCamera(FusedCurbResult fused, String role) {
-        for (CurbDetectionResult c : fused.perCamera) {
-            if (c.cameraId.equalsIgnoreCase(role)) {
-                return c;
+    private static class VehicleSimulateHandler implements HttpHandler {
+        private final UdpVehicleSignalService vehicleService;
+
+        VehicleSimulateHandler(UdpVehicleSignalService vehicleService) {
+            this.vehicleService = vehicleService;
+        }
+
+        @Override public void handle(HttpExchange ex) throws IOException {
+            String method = ex.getRequestMethod();
+            if (!"POST".equalsIgnoreCase(method) && !"GET".equalsIgnoreCase(method)) {
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            String scenario = queryParam(ex.getRequestURI().getQuery(), "scenario");
+            if (scenario == null || scenario.isEmpty()) {
+                scenario = "RIGHT_TURN";
+            }
+            vehicleService.simulator().startScenario(scenario);
+            byte[] body = ("{\"started\":true,\"scenario\":\"" + scenario + "\"}")
+                    .getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+            ex.sendResponseHeaders(200, body.length);
+            try (OutputStream out = ex.getResponseBody()) {
+                out.write(body);
             }
         }
-        return CurbDetectionResult.noDetection(fused.timestampMs, role);
+
+        private static String queryParam(String query, String key) {
+            if (query == null) {
+                return null;
+            }
+            for (String part : query.split("&")) {
+                int eq = part.indexOf('=');
+                if (eq > 0 && part.substring(0, eq).equals(key)) {
+                    return part.substring(eq + 1);
+                }
+            }
+            return null;
+        }
     }
 
     private static class CorrectedHandler implements HttpHandler {
-        private final Path[] videoFiles;
         private final SurroundPipeline pipeline;
+        private final FrameDistributor distributor;
         private final String role;
 
-        CorrectedHandler(Path[] f, SurroundPipeline pipeline, String role) {
-            this.videoFiles = f;
+        CorrectedHandler(SurroundPipeline pipeline, FrameDistributor distributor, String role) {
             this.pipeline = pipeline;
+            this.distributor = distributor;
             this.role = role;
         }
 
@@ -294,57 +301,44 @@ public class VideoStreamingServer {
                 ex.sendResponseHeaders(404, -1);
                 return;
             }
-            streamMjpeg(ex, videoFiles, pipeline, true, idx);
+            streamMjpeg(ex, pipeline, distributor, true, idx);
         }
     }
 
-    private static void streamMjpeg(HttpExchange ex, Path[] videoFiles,
-                                    SurroundPipeline pipeline, boolean rectilinear,
+    private static void streamMjpeg(HttpExchange ex,
+                                    SurroundPipeline pipeline,
+                                    FrameDistributor distributor,
+                                    boolean rectilinear,
                                     int cameraIndex) throws IOException {
-        VideoCapture[] caps = new VideoCapture[videoFiles.length];
-        for (int i = 0; i < videoFiles.length; i++) {
-            caps[i] = openVideo(videoFiles[i]);
-            if (caps[i] == null || !caps[i].isOpened()) {
-                System.err.println("Could not open video: " + videoFiles[i]);
-                ex.sendResponseHeaders(500, -1);
-                return;
-            }
-        }
         ex.getResponseHeaders().set("Content-Type",
                 "multipart/x-mixed-replace; boundary=frame");
         ex.sendResponseHeaders(200, 0);
+        Mat rect = new Mat();
+        long lastSeq = 0;
         try (OutputStream out = ex.getResponseBody()) {
-            Mat[] frames = new Mat[videoFiles.length];
-            Mat rect = new Mat();
-            for (int i = 0; i < videoFiles.length; i++) {
-                frames[i] = new Mat();
-            }
             while (true) {
-                boolean allReady = true;
-                for (int i = 0; i < caps.length; i++) {
-                    if (!readOrLoop(caps, i, videoFiles[i], frames[i])) {
-                        allReady = false;
+                FrameSnapshot snap;
+                try {
+                    snap = distributor.awaitVideoFrame(lastSeq);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                try {
+                    Mat output;
+                    if (rectilinear) {
+                        pipeline.rectify(cameraIndex, snap.fisheyeBgr[cameraIndex], rect);
+                        output = rect;
+                    } else {
+                        output = pipeline.stitchPanorama(snap.fisheyeBgr);
                     }
-                }
-                if (!allReady) {
-                    continue;
-                }
-                Mat output;
-                if (rectilinear) {
-                    pipeline.rectify(cameraIndex, frames[cameraIndex], rect);
-                    output = rect;
-                } else {
-                    output = pipeline.stitchPanorama(frames);
-                }
-                writeFrame(out, encodeJpeg(output));
-                if (!rectilinear) {
-                    output.release();
-                }
-            }
-        } finally {
-            for (VideoCapture c : caps) {
-                if (c != null) {
-                    c.release();
+                    writeFrame(out, encodeJpeg(output));
+                    if (!rectilinear) {
+                        output.release();
+                    }
+                    lastSeq = snap.sequence;
+                } finally {
+                    snap.release();
                 }
             }
         }
