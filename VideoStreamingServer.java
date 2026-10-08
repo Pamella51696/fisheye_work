@@ -64,16 +64,19 @@ private static final double FISHEYE_CY = 0.50;
     private static final String[] CAM_ROLE      = { "left", "front", "right", "rear" };
  
     public static void main(String[] args) throws IOException {
-        int port = DEFAULT_PORT;
-        if (args.length >= 1) {
-            try {
-                port = Integer.parseInt(args[0]);
-            } catch (NumberFormatException e) {
-                System.err.println("First argument must be a port number, got: " + args[0]);
-                return;
-            }
+        MiddlewareConfig middleware = MiddlewareConfig.fromEnvironmentAndArgs(args, DEFAULT_PORT);
+        int port = middleware.httpPort;
+
+        UdpVehiclePosePublisher posePublisher = null;
+        try {
+            posePublisher = MiddlewareLauncher.startPoseUdp(middleware);
+        } catch (Exception e) {
+            System.err.println("Could not start UDP pose publisher: " + e.getMessage());
         }
- 
+        if (posePublisher != null) {
+            Runtime.getRuntime().addShutdownHook(new Thread(posePublisher::close, "udp-pose-shutdown"));
+        }
+
         Path folder = Paths.get(".").toAbsolutePath().normalize();
         Path[] videos = discoverClips(folder);
         if (videos == null) {
