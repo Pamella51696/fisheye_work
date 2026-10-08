@@ -19,4 +19,4 @@ if ! dpkg -s libopencv-java >/dev/null 2>&1; then
 fi
 
 mkdir -p build
-javac -d build -cp /usr/share/java/opencv.jar VideoStreamingServer.java
+javac -d build -cp /usr/share/java/opencv.jar *.java

@@ -10,4 +10,8 @@ fi
 
 exec java -Djava.library.path=/usr/lib/jni \
   -cp build:/usr/share/java/opencv.jar \
-  VideoStreamingServer 9090
+  VideoStreamingServer 9090 \
+  ${UDP_TARGET_HOST:+--udp-target "$UDP_TARGET_HOST"} \
+  ${UDP_PORT:+--udp-port "$UDP_PORT"} \
+  ${UDP_HZ:+--udp-hz "$UDP_HZ"} \
+  ${POSE_MODE:+--pose-mode "$POSE_MODE"}
