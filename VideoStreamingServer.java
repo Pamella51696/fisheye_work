@@ -13,6 +13,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.Executors;
  
 import org.opencv.core.*;
@@ -20,48 +21,37 @@ import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.Imgproc;
 import org.opencv.videoio.VideoCapture;
 import org.opencv.videoio.Videoio;
+
+import configuration.CurbConfig;
+import output.CurbDetectionResult;
+import output.FusedCurbResult;
+import perception.curb.CurbPerceptionPipeline;
+import surround.analytics.CurbDebugOverlay;
+import surround.analytics.CurbDetectionService;
+import surround.analytics.CurbResultFilter;
+import surround.runtime.CameraCaptureManager;
+import surround.runtime.CameraIo;
+import surround.runtime.FrameDistributor;
+import surround.runtime.FrameSnapshot;
+import surround.runtime.SurroundPipeline;
+import surround.signal.SignalPublisher;
+import surround.vehicle.UdpVehicleSignalService;
+import surround.vehicle.VehicleSignalSimulator;
  
 /**
  * Multi-camera panoramic projection with a shared vehicle-frame horizon.
  *
- *   fisheye pixels → 3D rays → R_camera (extrinsics) → common vehicle frame
- *        → spherical (θ, φ) → LEFT | FRONT | RIGHT | REAR canvas → feather
- *
- * Horizon is φ = 0 in the vehicle frame (pose), not an image-space shift.
- * Clips are discovered in the working folder (left / front / right / rear).
+ * Ray-based surround pipeline (see {@code config/rig.json}).
+ * Fisheye → camera model → 3D ray → vehicle frame → panorama → feather blend.
+ * Rectilinear corrected feeds: {@code /corrected/<role>}.
+ * Curb + vehicle signals: {@code /api/signals} (async analytics, not in video loop).
  */
 public class VideoStreamingServer {
  
     private static final int DEFAULT_PORT = 9090;
-    private static final int PANEL_WIDTH  = 640;
-    private static final int PANEL_HEIGHT = 400;
-    /** Row of the common world horizon (fraction from the top). */
-    private static final double HORIZON_FRACTION = 0.40;
-    /** Horizontal field of each spherical panel (deg). >90 leaves overlap. */
-    private static final double PANEL_YAW_DEG = 118.0;
-    /** Vertical field around the horizon (deg). */
-    private static final double PANEL_PITCH_DEG = 72.0;
-    /** Equidistant fisheye input FOV used to build K when no calib file exists. */
-    private static final double INPUT_FISHEYE_FOV_DEG = 190.0;
-/** Stop sampling past this angle from the lens axis — real fisheye glass
- *  degrades near the rim, so this keeps panels out of the bad zone. */
-private static final double MAX_INCIDENCE_DEG = 78.0;
-/** Optical center as a fraction of image size; 0.5/0.5 = geometric center. */
-private static final double FISHEYE_CX = 0.50;
-private static final double FISHEYE_CY = 0.50;
-    /** Only treat near-black remap holes as invalid (keep dark asphalt). */
-    private static final double INVALID_LUMA = 3.0;
-    /** Minimum seam width in pixels so feeds dissolve instead of overwriting. */
-    private static final int MIN_BLEND_PX = 34;
-    /** Fade distance from unmapped (black) pixels. */
-    private static final int EDGE_FEATHER_PX = 100;
- 
-    /** Vehicle yaw of each camera, Left → Front → Right → Rear. */
-    private static final double[] CAM_YAW_DEG   = { -90.0, 0.0, 90.0, 180.0 };
-    /** Pitch: negative looks toward the ground (typical bumper / wing mount). */
-    private static final double[] CAM_PITCH_DEG = { -14.0, -12.0, -14.0, -21.0 };
-    private static final double[] CAM_ROLL_DEG  = {  0.0,  0.0,  0.0,   0.0 };
-    private static final String[] CAM_ROLE      = { "left", "front", "right", "rear" };
+    private static final Path RIG_CONFIG = Paths.get("config", "rig.json");
+    private static final Path CURB_CONFIG = Paths.get("config", "curb.json");
+    private static final String[] CAM_ROLE = { "left", "front", "right", "rear" };
  
     public static void main(String[] args) throws IOException {
         int port = DEFAULT_PORT;
@@ -86,20 +76,72 @@ private static final double FISHEYE_CY = 0.50;
             System.err.println("OpenCV native library not found: " + e.getMessage());
             return;
         }
-        loadFfmpegPlugin();
- 
+        CameraIo.loadFfmpegPlugin();
+
+        SurroundPipeline pipeline;
+        try {
+            pipeline = SurroundPipeline.load(RIG_CONFIG);
+        } catch (IOException e) {
+            System.err.println("Missing or invalid " + RIG_CONFIG.toAbsolutePath()
+                    + " — run: python3 calibration/synthetic_calibrate.py .");
+            System.err.println(e.getMessage());
+            return;
+        }
+
+        FrameDistributor frameDistributor = new FrameDistributor();
+        CameraCaptureManager captureManager =
+                new CameraCaptureManager(videos, frameDistributor);
+        captureManager.start();
+
+        CurbDetectionService curbService = null;
+        SignalPublisher signalPublisher = null;
+        UdpVehicleSignalService vehicleService = new UdpVehicleSignalService(new VehicleSignalSimulator());
+        vehicleService.start();
+        try {
+            CurbConfig curbConfig = CurbConfig.load(CURB_CONFIG);
+            CurbPerceptionPipeline curbPipeline =
+                    new CurbPerceptionPipeline(curbConfig, pipeline);
+            CurbResultFilter filter = new CurbResultFilter(0.08, 500);
+            curbService = new CurbDetectionService(frameDistributor, curbPipeline, filter);
+            curbService.start();
+            signalPublisher = new SignalPublisher(curbService, vehicleService, 1.0);
+            System.out.println("Async curb analytics enabled (" + CURB_CONFIG + ")");
+        } catch (IOException e) {
+            System.err.println("Curb config missing; curb signals UNAVAILABLE: " + e.getMessage());
+            signalPublisher = new SignalPublisher(null, vehicleService, 1.0);
+        }
+
+        final SignalPublisher signals = signalPublisher;
+        final UdpVehicleSignalService vehicle = vehicleService;
+        final CurbDetectionService curbSvc = curbService;
+
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.createContext("/stitch", new StitchHandler(videos));
-        server.createContext("/play",   new PlayerPageHandler());
+        server.createContext("/stitch", new StitchHandler(pipeline, frameDistributor));
+        for (String role : CAM_ROLE) {
+            server.createContext("/corrected/" + role,
+                    new CorrectedHandler(pipeline, frameDistributor, role));
+        }
+        if (curbSvc != null) {
+            for (String role : CAM_ROLE) {
+                server.createContext("/debug/curb/" + role,
+                        new DebugCurbHandler(pipeline, frameDistributor, curbSvc, role));
+            }
+        }
+        server.createContext("/api/signals", new SignalsHandler(signals, false));
+        server.createContext("/api/signals/stream", new SignalsHandler(signals, true));
+        server.createContext("/api/vehicle/simulate", new VehicleSimulateHandler(vehicle));
+        server.createContext("/play",   new PlayerPageHandler(port, curbSvc != null));
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
  
         System.out.println("Server started  ->  http://localhost:" + port + "/play");
+        System.out.println("  Panorama (no curb overlay): /stitch");
+        if (curbSvc != null) {
+            System.out.println("  Curb DEV overlay: /debug/curb/right  (also left, front, rear)");
+            System.out.println("  Curb JSON: /api/signals");
+        }
         for (int i = 0; i < CAM_ROLE.length; i++) {
-            System.out.println("  " + CAM_ROLE[i] + " = " + videos[i]
-                    + "  yaw=" + CAM_YAW_DEG[i]
-                    + " pitch=" + CAM_PITCH_DEG[i]
-                    + " roll=" + CAM_ROLL_DEG[i]);
+            System.out.println("  " + CAM_ROLE[i] + " = " + videos[i]);
         }
     }
  
@@ -118,7 +160,7 @@ private static final double FISHEYE_CY = 0.50;
                         + CAM_ROLE[i] + ".mp4)");
                 return null;
             }
-            found[i] = ensureDecodable(found[i]);
+            found[i] = CameraIo.ensureDecodable(found[i]);
         }
         return found;
     }
@@ -157,455 +199,293 @@ private static final double FISHEYE_CY = 0.50;
     }
  
     private static class StitchHandler implements HttpHandler {
-        private final Path[] videoFiles;
-        StitchHandler(Path[] f) { this.videoFiles = f; }
- 
+        private final SurroundPipeline pipeline;
+        private final FrameDistributor distributor;
+
+        StitchHandler(SurroundPipeline pipeline, FrameDistributor distributor) {
+            this.pipeline = pipeline;
+            this.distributor = distributor;
+        }
+
         @Override public void handle(HttpExchange ex) throws IOException {
             if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
                 ex.sendResponseHeaders(405, -1);
                 return;
             }
- 
-            VideoCapture[] caps = new VideoCapture[videoFiles.length];
-            for (int i = 0; i < videoFiles.length; i++) {
-                caps[i] = openVideo(videoFiles[i]);
-                if (caps[i] == null || !caps[i].isOpened()) {
-                    System.err.println("Could not open video: " + videoFiles[i]);
-                    ex.sendResponseHeaders(500, -1);
-                    return;
+            streamMjpeg(ex, pipeline, distributor, false, -1);
+        }
+    }
+
+    private static class SignalsHandler implements HttpHandler {
+        private final SignalPublisher publisher;
+        private final boolean stream;
+
+        SignalsHandler(SignalPublisher publisher, boolean stream) {
+            this.publisher = publisher;
+            this.stream = stream;
+        }
+
+        @Override public void handle(HttpExchange ex) throws IOException {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            if (stream) {
+                ex.getResponseHeaders().set("Content-Type", "application/x-ndjson; charset=UTF-8");
+                ex.sendResponseHeaders(200, 0);
+                try (OutputStream out = ex.getResponseBody()) {
+                    while (true) {
+                        String line = publisher.toJson();
+                        out.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        Thread.sleep(100);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            } else {
+                byte[] bytes = publisher.toJson().getBytes(StandardCharsets.UTF_8);
+                ex.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+                ex.sendResponseHeaders(200, bytes.length);
+                try (OutputStream out = ex.getResponseBody()) {
+                    out.write(bytes);
                 }
             }
- 
-            SphericalPanel[] panels = new SphericalPanel[videoFiles.length];
-            for (int i = 0; i < panels.length; i++) {
-                panels[i] = new SphericalPanel(i);
+        }
+    }
+
+    private static class VehicleSimulateHandler implements HttpHandler {
+        private final UdpVehicleSignalService vehicleService;
+
+        VehicleSimulateHandler(UdpVehicleSignalService vehicleService) {
+            this.vehicleService = vehicleService;
+        }
+
+        @Override public void handle(HttpExchange ex) throws IOException {
+            String method = ex.getRequestMethod();
+            if (!"POST".equalsIgnoreCase(method) && !"GET".equalsIgnoreCase(method)) {
+                ex.sendResponseHeaders(405, -1);
+                return;
             }
- 
-            int overlap = panelOverlapPx();
+            String scenario = queryParam(ex.getRequestURI().getQuery(), "scenario");
+            if (scenario == null || scenario.isEmpty()) {
+                scenario = "RIGHT_TURN";
+            }
+            vehicleService.simulator().startScenario(scenario);
+            byte[] body = ("{\"started\":true,\"scenario\":\"" + scenario + "\"}")
+                    .getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+            ex.sendResponseHeaders(200, body.length);
+            try (OutputStream out = ex.getResponseBody()) {
+                out.write(body);
+            }
+        }
+
+        private static String queryParam(String query, String key) {
+            if (query == null) {
+                return null;
+            }
+            for (String part : query.split("&")) {
+                int eq = part.indexOf('=');
+                if (eq > 0 && part.substring(0, eq).equals(key)) {
+                    return part.substring(eq + 1);
+                }
+            }
+            return null;
+        }
+    }
+
+    private static class DebugCurbHandler implements HttpHandler {
+        private final SurroundPipeline pipeline;
+        private final FrameDistributor distributor;
+        private final CurbDetectionService curbService;
+        private final String role;
+
+        DebugCurbHandler(SurroundPipeline pipeline, FrameDistributor distributor,
+                         CurbDetectionService curbService, String role) {
+            this.pipeline = pipeline;
+            this.distributor = distributor;
+            this.curbService = curbService;
+            this.role = role;
+        }
+
+        @Override public void handle(HttpExchange ex) throws IOException {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            int idx = pipeline.cameraIndex(role);
+            if (idx < 0) {
+                ex.sendResponseHeaders(404, -1);
+                return;
+            }
             ex.getResponseHeaders().set("Content-Type",
                     "multipart/x-mixed-replace; boundary=frame");
             ex.sendResponseHeaders(200, 0);
- 
+            Mat rect = new Mat();
+            long lastSeq = 0;
             try (OutputStream out = ex.getResponseBody()) {
-                Mat[] frames = new Mat[videoFiles.length];
-                Mat[] ready  = new Mat[videoFiles.length];
-                for (int i = 0; i < videoFiles.length; i++) {
-                    frames[i] = new Mat();
-                    ready[i]  = new Mat();
-                }
- 
                 while (true) {
-                    boolean allReady = true;
-                    for (int i = 0; i < caps.length; i++) {
-                        if (!readOrLoop(caps, i, videoFiles[i], frames[i])) {
-                            allReady = false;
-                            continue;
-                        }
-                        panels[i].project(frames[i], ready[i]);
-                        if (ready[i].empty()
-                                || ready[i].cols() != PANEL_WIDTH
-                                || ready[i].rows() != PANEL_HEIGHT) {
-                            allReady = false;
-                        }
+                    FrameSnapshot snap;
+                    try {
+                        snap = distributor.awaitVideoFrame(lastSeq);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
                     }
-                    if (!allReady) {
-                        continue;
+                    try {
+                        pipeline.rectify(idx, snap.fisheyeBgr[idx], rect);
+                        FusedCurbResult fused = curbService.lastFusedResult();
+                        CurbDetectionResult cam = fused == null
+                                ? CurbDetectionResult.noDetection(snap.timestampMs, role)
+                                : pickCamera(fused, role);
+                        CurbDebugOverlay.draw(rect, cam);
+                        writeFrame(out, encodeJpeg(rect));
+                        lastSeq = snap.sequence;
+                    } finally {
+                        snap.release();
                     }
-                    Mat panorama = featherStitch(ready, overlap);
-                    writeFrame(out, encodeJpeg(panorama));
-                    panorama.release();
                 }
-            } finally {
-                for (VideoCapture c : caps) {
-                    if (c != null) c.release();
+            }
+        }
+    }
+
+    private static CurbDetectionResult pickCamera(FusedCurbResult fused, String role) {
+        for (CurbDetectionResult c : fused.perCamera) {
+            if (c.cameraId.equalsIgnoreCase(role)) {
+                return c;
+            }
+        }
+        return CurbDetectionResult.noDetection(fused.timestampMs, role);
+    }
+
+    private static class CorrectedHandler implements HttpHandler {
+        private final SurroundPipeline pipeline;
+        private final FrameDistributor distributor;
+        private final String role;
+
+        CorrectedHandler(SurroundPipeline pipeline, FrameDistributor distributor, String role) {
+            this.pipeline = pipeline;
+            this.distributor = distributor;
+            this.role = role;
+        }
+
+        @Override public void handle(HttpExchange ex) throws IOException {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            int idx = pipeline.cameraIndex(role);
+            if (idx < 0) {
+                ex.sendResponseHeaders(404, -1);
+                return;
+            }
+            streamMjpeg(ex, pipeline, distributor, true, idx);
+        }
+    }
+
+    private static void streamMjpeg(HttpExchange ex,
+                                    SurroundPipeline pipeline,
+                                    FrameDistributor distributor,
+                                    boolean rectilinear,
+                                    int cameraIndex) throws IOException {
+        ex.getResponseHeaders().set("Content-Type",
+                "multipart/x-mixed-replace; boundary=frame");
+        ex.sendResponseHeaders(200, 0);
+        Mat rect = new Mat();
+        long lastSeq = 0;
+        try (OutputStream out = ex.getResponseBody()) {
+            while (true) {
+                FrameSnapshot snap;
+                try {
+                    snap = distributor.awaitVideoFrame(lastSeq);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                try {
+                    Mat output;
+                    if (rectilinear) {
+                        pipeline.rectify(cameraIndex, snap.fisheyeBgr[cameraIndex], rect);
+                        output = rect;
+                    } else {
+                        output = pipeline.stitchPanorama(snap.fisheyeBgr);
+                    }
+                    writeFrame(out, encodeJpeg(output));
+                    if (!rectilinear) {
+                        output.release();
+                    }
+                    lastSeq = snap.sequence;
+                } finally {
+                    snap.release();
                 }
             }
         }
     }
  
     private static class PlayerPageHandler implements HttpHandler {
+        private final int port;
+        private final boolean curbEnabled;
+
+        PlayerPageHandler(int port, boolean curbEnabled) {
+            this.port = port;
+            this.curbEnabled = curbEnabled;
+        }
+
         @Override public void handle(HttpExchange ex) throws IOException {
+            String curbPanel = "";
+            if (curbEnabled) {
+                curbPanel = ""
+                    + "<div id='curbStatus' class='curb-status'>Curb: loading…</div>"
+                    + "<div class='split'>"
+                    + "  <div class='pano-wrap'><img src='/stitch' alt='panorama'></div>"
+                    + "  <div class='pano-wrap'><img src='/debug/curb/right' alt='curb debug right'></div>"
+                    + "</div>"
+                    + "<p class='hint'>Left: stitch (no overlay). Right: dev curb overlay on corrected camera. "
+                    + "Production Android draws zones from <code>/api/signals</code>.</p>"
+                    + "<script>"
+                    + "async function poll(){try{const r=await fetch('/api/signals');"
+                    + "const j=await r.json();const c=j.curb||{};"
+                    + "const z=c.zone||c.status||'—';"
+                    + "const el=document.getElementById('curbStatus');"
+                    + "el.textContent=c.detected?('Curb '+z+' @ '+c.distanceMeters+'m ('+c.camera+')'):('Curb: '+ (c.status||'none'));"
+                    + "el.className='curb-status zone-'+(c.zone||'UNKNOWN');"
+                    + "}catch(e){}} setInterval(poll,500); poll();"
+                    + "</script>";
+            } else {
+                curbPanel = "<div class='pano-wrap'><img src='/stitch' alt='panorama'></div>";
+            }
             String html = "<!DOCTYPE html><html lang='en'><head>"
                 + "<meta charset='UTF-8'>"
                 + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>Common-horizon panorama</title>"
+                + "<title>Surround + curb debug</title>"
                 + "<style>"
                 + "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }"
                 + "html, body { height: 100%; background: #0a0a0f; color: #e0e0e0;"
-                + "  font-family: 'Segoe UI', sans-serif; overflow: hidden; }"
+                + "  font-family: 'Segoe UI', sans-serif; }"
                 + ".container { display: flex; flex-direction: column;"
-                + "  align-items: center; justify-content: center;"
-                + "  height: 100vh; padding: 16px; gap: 12px; }"
-                + "h1 { font-size: 1.25rem; font-weight: 300; letter-spacing: 1px;"
-                + "  color: #7ec8e3; text-align: center; flex-shrink: 0; }"
-                + ".pano-wrap { width: 100%; flex: 1; min-height: 0;"
-                + "  border: 1px solid #2a2a3a; border-radius: 8px; overflow: hidden;"
-                + "  display: flex; align-items: center; justify-content: center; }"
-                + ".pano-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }"
+                + "  height: 100vh; padding: 12px; gap: 8px; }"
+                + "h1 { font-size: 1.1rem; font-weight: 400; color: #7ec8e3; text-align: center; }"
+                + ".split { display: flex; gap: 8px; flex: 1; min-height: 0; }"
+                + ".pano-wrap { flex: 1; min-width: 0; border: 1px solid #2a2a3a; border-radius: 8px;"
+                + "  overflow: hidden; display: flex; align-items: center; justify-content: center; }"
+                + ".pano-wrap img { width: 100%; height: 100%; object-fit: contain; }"
+                + ".curb-status { text-align: center; padding: 8px; border-radius: 6px; background: #1a1a24; }"
+                + ".zone-GREEN{background:#0d2a14;color:#8f8;} .zone-YELLOW{background:#2a2208;color:#fd8;}"
+                + ".zone-RED{background:#2a0a0a;color:#f88;} .hint{font-size:0.8rem;color:#888;text-align:center;}"
+                + "code{color:#9cf;}"
                 + "</style></head><body>"
                 + "<div class='container'>"
-                + "  <h1>common vehicle horizon</h1>"
-                + "  <div class='pano-wrap'>"
-                + "    <img src='/stitch' alt='stitched panorama'>"
-                + "  </div>"
+                + "<h1>Surround view (port " + port + ")</h1>"
+                + curbPanel
                 + "</div></body></html>";
-            byte[] bytes = html.getBytes("UTF-8");
+            byte[] bytes = html.getBytes(StandardCharsets.UTF_8);
             ex.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
             ex.sendResponseHeaders(200, bytes.length);
             try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }
         }
     }
  
-    /**
-     * One surround camera: spherical dest pixels are inverse-projected through
-     * the vehicle frame and the fisheye model into the raw frame.
-     */
-    static final class SphericalPanel {
-        private final int index;
-        private final double[] R; // camera-to-vehicle, row-major
-        private Mat map1;
-        private Mat map2;
-        private int cachedSrcW = -1;
-        private int cachedSrcH = -1;
- 
-        SphericalPanel(int index) {
-            this.index = index;
-            this.R = cameraToVehicle(CAM_YAW_DEG[index],
-                    CAM_PITCH_DEG[index], CAM_ROLL_DEG[index]);
-        }
- 
-        void project(Mat src, Mat dst) {
-            if (src == null || src.empty()) {
-                return;
-            }
-            ensureMaps(src.cols(), src.rows());
-            Imgproc.remap(src, dst, map1, map2, Imgproc.INTER_LINEAR,
-                    Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
-        }
- 
-        private void ensureMaps(int srcW, int srcH) {
-            if (map1 != null && srcW == cachedSrcW && srcH == cachedSrcH) {
-                return;
-            }
-            double f = fisheyeFocal(srcW, srcH, INPUT_FISHEYE_FOV_DEG);
-double cx = srcW * FISHEYE_CX;
-double cy = srcH * FISHEYE_CY;
-double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
-            double yaw0 = Math.toRadians(CAM_YAW_DEG[index]);
-            double yawSpan = Math.toRadians(PANEL_YAW_DEG);
-            double pitchSpan = Math.toRadians(PANEL_PITCH_DEG);
-            double horizonY = HORIZON_FRACTION * PANEL_HEIGHT;
- 
-            Mat mapX = new Mat(PANEL_HEIGHT, PANEL_WIDTH, CvType.CV_32FC1);
-            Mat mapY = new Mat(PANEL_HEIGHT, PANEL_WIDTH, CvType.CV_32FC1);
-            float[] rowX = new float[PANEL_WIDTH];
-            float[] rowY = new float[PANEL_WIDTH];
- 
-            for (int v = 0; v < PANEL_HEIGHT; v++) {
-                // φ = 0 on the shared horizon row; positive φ is sky (up).
-                double phi = (horizonY - v) / PANEL_HEIGHT * pitchSpan;
-                double cphi = Math.cos(phi);
-                double sphi = Math.sin(phi);
-                for (int u = 0; u < PANEL_WIDTH; u++) {
-                    double theta = yaw0 + ((u + 0.5) / PANEL_WIDTH - 0.5) * yawSpan;
-                    // Vehicle frame: X forward, Y right, Z up.
-                    double xv = cphi * Math.cos(theta);
-                    double yv = cphi * Math.sin(theta);
-                    double zv = sphi;
-                    // ray_camera = R^T * ray_vehicle  (OpenCV: X right, Y down, Z forward)
-                    double xc = R[0] * xv + R[3] * yv + R[6] * zv;
-                    double yc = R[1] * xv + R[4] * yv + R[7] * zv;
-                    double zc = R[2] * xv + R[5] * yv + R[8] * zv;
-                    if (zc <= 1e-4) {
-                        rowX[u] = -1f;
-                        rowY[u] = -1f;
-                        continue;
-                    }
-                                        double inc = Math.atan2(Math.hypot(xc, yc), zc);
-                    if (inc > maxInc) {
-                        rowX[u] = -1f;
-                        rowY[u] = -1f;
-                        continue;
-                    }
-                    double r = fisheyeRadius(inc, f);
-                    double az = Math.atan2(yc, xc);
-                    float su = (float) (cx + r * Math.cos(az));
-                    float sv = (float) (cy + r * Math.sin(az));
-                    if (su < 1 || sv < 1 || su >= srcW - 1 || sv >= srcH - 1) {
-                        rowX[u] = -1f;
-                        rowY[u] = -1f;
-                    } else {
-                        rowX[u] = su;
-                        rowY[u] = sv;
-                    }
-                }
-                mapX.put(v, 0, rowX);
-                mapY.put(v, 0, rowY);
-            }
- 
-            if (map1 == null) map1 = new Mat();
-            if (map2 == null) map2 = new Mat();
-            Imgproc.convertMaps(mapX, mapY, map1, map2, CvType.CV_16SC2, false);
-            mapX.release();
-            mapY.release();
-            cachedSrcW = srcW;
-            cachedSrcH = srcH;
-        }
-    }
- 
-    /**
-     * R maps OpenCV camera rays to the vehicle frame:
-     *   ray_vehicle = R * ray_camera
-     * Front-looking camera (yaw=pitch=roll=0): Z_cam → X_veh, X_cam → Y_veh,
-     * -Y_cam → Z_veh.
-     */
-    static double[] cameraToVehicle(double yawDeg, double pitchDeg, double rollDeg) {
-        double[] rcv = {
-            0, 0, 1,
-            1, 0, 0,
-            0,-1, 0
-        };
-        double[] rx = rotX(Math.toRadians(rollDeg));
-        // Negative pitchDeg looks toward the ground (optical axis below the horizon).
-        double[] ry = rotY(Math.toRadians(-pitchDeg));
-        double[] rz = rotZ(Math.toRadians(yawDeg));
-        return mul3(rz, mul3(ry, mul3(rx, rcv)));
-    }
- 
-    static double[] rotX(double a) {
-        double c = Math.cos(a), s = Math.sin(a);
-        return new double[] {
-            1, 0, 0,
-            0, c,-s,
-            0, s, c
-        };
-    }
- 
-    static double[] rotY(double a) {
-        double c = Math.cos(a), s = Math.sin(a);
-        return new double[] {
-             c, 0, s,
-             0, 1, 0,
-            -s, 0, c
-        };
-    }
- 
-    static double[] rotZ(double a) {
-        double c = Math.cos(a), s = Math.sin(a);
-        return new double[] {
-            c,-s, 0,
-            s, c, 0,
-            0, 0, 1
-        };
-    }
- 
-    static double[] mul3(double[] a, double[] b) {
-        double[] c = new double[9];
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) {
-                c[i * 3 + j] = a[i * 3] * b[j]
-                        + a[i * 3 + 1] * b[3 + j]
-                        + a[i * 3 + 2] * b[6 + j];
-            }
-        }
-        return c;
-    }
- 
-    static double fisheyeFocal(int width, int height, double fovDeg) {
-        double half = Math.toRadians(fovDeg) / 2.0;
-        return (Math.min(width, height) / 2.0) / half;
-    }
- 
-    static double fisheyeRadius(double incidence, double focal) {
-    return focal * incidence; // pure equidistant, no distortion terms yet
-}
- 
-        static int panelOverlapPx() {
-        // MIN_BLEND_PX is now the actual seam width used, not just a floor —
-        // this directly controls how wide the ghost/blend zone is.
-        return Math.max(16, Math.min(PANEL_WIDTH / 3, MIN_BLEND_PX));
-    }
- 
-    static Mat featherStitch(Mat[] frames, int overlap) {
-        int N = frames.length;
-        int H = PANEL_HEIGHT;
-        int W = PANEL_WIDTH;
-        int panoW = W + (N - 1) * (W - overlap);
-        double[] gain = sequentialGains(frames, overlap);
- 
-                Mat accumColor  = Mat.zeros(H, panoW, CvType.CV_32FC3);
-        Mat accumWeight = Mat.zeros(H, panoW, CvType.CV_32FC1);
-        // Tracks the single best (highest-confidence) source pixel seen so
-        // far at each column, so low-confidence blend regions can fall back
-        // to real camera data instead of being blacked out.
-        Mat maxWeight = Mat.zeros(H, panoW, CvType.CV_32FC1);
-        Mat maxColor  = Mat.zeros(H, panoW, CvType.CV_32FC3);
- 
-        for (int i = 0; i < N; i++) {
-            int xStart = i * (W - overlap);
-            // Incoming panel ramps in slowly so it does not stamp over the
-            // previous feed (the left→front overwrite). Outgoing stays visible
-            // longer into the seam.
-            Mat weight = buildFeatherMask(H, W, overlap, i > 0, i < N - 1, 0.55, 0.55);
-            Mat edgeW = edgeDistanceWeight(frames[i], EDGE_FEATHER_PX);
-            Core.multiply(weight, edgeW, weight);
-            edgeW.release();
- 
-            Mat frameF = new Mat();
-            frames[i].convertTo(frameF, CvType.CV_32FC3);
-            if (Math.abs(gain[i] - 1.0) > 0.01) {
-                Core.multiply(frameF, new Scalar(gain[i], gain[i], gain[i]), frameF);
-            }
-            Mat weight3 = new Mat();
-            List<Mat> ch = new ArrayList<>();
-            ch.add(weight); ch.add(weight); ch.add(weight);
-            Core.merge(ch, weight3);
-            Mat wFrame = new Mat();
-            Core.multiply(frameF, weight3, wFrame);
- 
-            int xEnd = Math.min(xStart + W, panoW);
-            int wActual = xEnd - xStart;
-            Mat colorRoi  = accumColor.submat(0, H, xStart, xEnd);
-            Mat weightRoi = accumWeight.submat(0, H, xStart, xEnd);
-                        Core.add(colorRoi,  wFrame.colRange(0, wActual), colorRoi);
-            Core.add(weightRoi, weight.colRange(0, wActual), weightRoi);
- 
-            Mat maxColorRoi  = maxColor.submat(0, H, xStart, xEnd);
-            Mat maxWeightRoi = maxWeight.submat(0, H, xStart, xEnd);
-            Mat greaterMask = new Mat();
-            Core.compare(weight.colRange(0, wActual), maxWeightRoi, greaterMask, Core.CMP_GT);
-            frameF.colRange(0, wActual).copyTo(maxColorRoi, greaterMask);
-            weight.colRange(0, wActual).copyTo(maxWeightRoi, greaterMask);
-            greaterMask.release();
-            maxColorRoi.release();
-            maxWeightRoi.release();
- 
-            colorRoi.release();
-            weightRoi.release();
-            frameF.release();
-            weight.release();
-            weight3.release();
-            wFrame.release();
-        }
- 
-                Mat safeW = new Mat();
-        Core.max(accumWeight, new Scalar(1e-6), safeW);
-        Mat safeW3 = new Mat();
-        List<Mat> wch = new ArrayList<>();
-        wch.add(safeW); wch.add(safeW); wch.add(safeW);
-        Core.merge(wch, safeW3);
-        Mat blended = new Mat();
-        Core.divide(accumColor, safeW3, blended);
- 
-        // Anywhere total confidence is too low, the divide above blows up
-        // small residual color into a bright artifact — force those pixels
-        // to black instead of trusting the division.
-        Mat lowWeightMask = new Mat();
-        Core.compare(accumWeight, new Scalar(0.02), lowWeightMask, Core.CMP_LT);
-        maxColor.copyTo(blended, lowWeightMask);
-        lowWeightMask.release();
- 
-        Mat result = new Mat();
-        blended.convertTo(result, CvType.CV_8UC3);
- 
-                accumColor.release();
-        accumWeight.release();
-        maxWeight.release();
-        maxColor.release();
-        safeW.release();
-        safeW3.release();
-        blended.release();
-        return result;
-    }
- 
- 
-    /**
-     * Raised-cosine seam. {@code inExp} &gt; 1 makes the new panel fade in slowly;
-     * {@code outExp} &lt; 1 keeps the old panel visible further into the overlap.
-     */
-    static Mat buildFeatherMask(int H, int W, int overlap,
-                                boolean fadeLeft, boolean fadeRight,
-                                double inExp, double outExp) {
-        Mat mask = new Mat(H, W, CvType.CV_32FC1, new Scalar(1.0));
-        if (overlap <= 0) {
-            return mask;
-        }
-        for (int x = 0; x < overlap; x++) {
-            double cosine = 0.5 - 0.5 * Math.cos(Math.PI * x / overlap);
-            if (fadeLeft) {
-                float alpha = (float) Math.pow(cosine, inExp);
-                Mat colL = mask.col(x);
-                colL.setTo(new Scalar(alpha));
-                colL.release();
-            }
-            if (fadeRight) {
-                float alpha = (float) Math.pow(cosine, outExp);
-                Mat colR = mask.col(W - 1 - x);
-                colR.setTo(new Scalar(alpha));
-                colR.release();
-            }
-        }
-        return mask;
-    }
- 
-        static Mat edgeDistanceWeight(Mat bgr, int radius) {
-        Mat gray = new Mat();
-        Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
-        Mat mask = new Mat();
-        Imgproc.threshold(gray, mask, INVALID_LUMA, 255, Imgproc.THRESH_BINARY);
-        // Real remap gaps are large solid black regions; small dark specks
-        // (tires, shadows, window tint) are valid content, not gaps.
-        // Close them up so they don't get treated as missing data.
-        Mat closeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, new Size(35, 35));
-        Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_CLOSE, closeKernel);
-        closeKernel.release();
-        Mat dist = new Mat();
-        Imgproc.distanceTransform(mask, dist, Imgproc.DIST_L2, 3);
-        Mat weight = new Mat();
-        double scale = radius < 1 ? 1.0 : 1.0 / radius;
-        dist.convertTo(weight, CvType.CV_32FC1, scale);
-        Core.min(weight, new Scalar(1.0), weight);
-        gray.release();
-        mask.release();
-        dist.release();
-        return weight;
-    }
- 
-    static double[] sequentialGains(Mat[] frames, int overlap) {
-        double[] gain = new double[frames.length];
-        java.util.Arrays.fill(gain, 1.0);
-        for (int i = 1; i < frames.length; i++) {
-            double left = overlapMean(frames[i - 1], true, overlap);
-            double right = overlapMean(frames[i], false, overlap);
-            if (left < 8 || right < 8) {
-                continue;
-            }
-            double g = left / right;
-            if (g < 0.75) g = 0.75;
-            if (g > 1.35) g = 1.35;
-            gain[i] = gain[i - 1] * g;
-            if (gain[i] < 0.75) gain[i] = 0.75;
-            if (gain[i] > 1.35) gain[i] = 1.35;
-        }
-        return gain;
-    }
- 
-    static double overlapMean(Mat bgr, boolean rightEdge, int overlap) {
-        int W = bgr.cols();
-        int H = bgr.rows();
-        int x0 = rightEdge ? W - overlap : 0;
-        int x1 = rightEdge ? W : overlap;
-        Mat roi = bgr.submat(0, H, x0, x1);
-        Mat gray = new Mat();
-        Imgproc.cvtColor(roi, gray, Imgproc.COLOR_BGR2GRAY);
-        Mat mask = new Mat();
-        Imgproc.threshold(gray, mask, INVALID_LUMA, 255, Imgproc.THRESH_BINARY);
-        Scalar m = Core.mean(gray, mask);
-        roi.release();
-        gray.release();
-        mask.release();
-        return m.val[0];
-    }
  
     static Path ensureDecodable(Path requested) {
         Path mp4 = siblingWithExt(requested, ".mp4");
