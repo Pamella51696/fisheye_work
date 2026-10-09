@@ -13,6 +13,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.Executors;
  
 import org.opencv.core.*;
@@ -21,7 +22,23 @@ import org.opencv.imgproc.Imgproc;
 import org.opencv.videoio.VideoCapture;
 import org.opencv.videoio.Videoio;
 
+import configuration.CurbConfig;
+import output.CurbDetectionResult;
+import output.FusedCurbResult;
+import perception.curb.CurbPerceptionPipeline;
+import surround.analytics.CurbDebugOverlay;
+import surround.analytics.CurbDetectionService;
+import surround.analytics.CurbResultFilter;
+import surround.runtime.CameraCaptureManager;
+import surround.runtime.CameraIo;
+import surround.runtime.FrameDistributor;
+import surround.runtime.FrameSnapshot;
 import surround.runtime.SurroundPipeline;
+import surround.signal.SignalPublisher;
+import surround.signal.SignalWebSocketServer;
+import surround.vehicle.UdpVehicleSignalService;
+import surround.vehicle.VehicleSignalConfig;
+import surround.vehicle.VehicleSignalSimulator;
  
 /**
  * Multi-camera panoramic projection with a shared vehicle-frame horizon.
@@ -29,23 +46,18 @@ import surround.runtime.SurroundPipeline;
  * Ray-based surround pipeline (see {@code config/rig.json}).
  * Fisheye → camera model → 3D ray → vehicle frame → panorama → feather blend.
  * Rectilinear corrected feeds: {@code /corrected/<role>}.
+ * Curb + vehicle signals: {@code /api/signals} (async analytics, not in video loop).
  */
 public class VideoStreamingServer {
  
     private static final int DEFAULT_PORT = 9090;
     private static final Path RIG_CONFIG = Paths.get("config", "rig.json");
+    private static final Path CURB_CONFIG = Paths.get("config", "curb.json");
     private static final String[] CAM_ROLE = { "left", "front", "right", "rear" };
  
     public static void main(String[] args) throws IOException {
-        int port = DEFAULT_PORT;
-        if (args.length >= 1) {
-            try {
-                port = Integer.parseInt(args[0]);
-            } catch (NumberFormatException e) {
-                System.err.println("First argument must be a port number, got: " + args[0]);
-                return;
-            }
-        }
+        VehicleSignalConfig vehicleConfig = VehicleSignalConfig.parse(args, DEFAULT_PORT);
+        int port = vehicleConfig.httpPort;
  
         Path folder = Paths.get(".").toAbsolutePath().normalize();
         Path[] videos = discoverClips(folder);
@@ -59,7 +71,7 @@ public class VideoStreamingServer {
             System.err.println("OpenCV native library not found: " + e.getMessage());
             return;
         }
-        loadFfmpegPlugin();
+        CameraIo.loadFfmpegPlugin();
 
         SurroundPipeline pipeline;
         try {
@@ -70,17 +82,71 @@ public class VideoStreamingServer {
             System.err.println(e.getMessage());
             return;
         }
- 
-        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.createContext("/stitch", new StitchHandler(videos, pipeline));
-        for (String role : CAM_ROLE) {
-            server.createContext("/corrected/" + role, new CorrectedHandler(videos, pipeline, role));
+
+        FrameDistributor frameDistributor = new FrameDistributor();
+        CameraCaptureManager captureManager =
+                new CameraCaptureManager(videos, frameDistributor);
+        captureManager.start();
+
+        CurbDetectionService curbService = null;
+        SignalPublisher signalPublisher = null;
+        UdpVehicleSignalService vehicleService =
+                new UdpVehicleSignalService(new VehicleSignalSimulator(), vehicleConfig);
+        vehicleService.start();
+        try {
+            CurbConfig curbConfig = CurbConfig.load(CURB_CONFIG);
+            CurbPerceptionPipeline curbPipeline =
+                    new CurbPerceptionPipeline(curbConfig, pipeline);
+            CurbResultFilter filter = new CurbResultFilter(0.08, 500);
+            curbService = new CurbDetectionService(frameDistributor, curbPipeline, filter);
+            curbService.start();
+            signalPublisher = new SignalPublisher(curbService, vehicleService, 1.0);
+            System.out.println("Async curb analytics enabled (" + CURB_CONFIG + ")");
+        } catch (IOException e) {
+            System.err.println("Curb config missing; curb signals UNAVAILABLE: " + e.getMessage());
+            signalPublisher = new SignalPublisher(null, vehicleService, 1.0);
         }
-        server.createContext("/play",   new PlayerPageHandler());
+
+        final SignalPublisher signals = signalPublisher;
+        final UdpVehicleSignalService vehicle = vehicleService;
+        final CurbDetectionService curbSvc = curbService;
+
+        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+        server.createContext("/stitch", new StitchHandler(pipeline, frameDistributor));
+        for (String role : CAM_ROLE) {
+            server.createContext("/corrected/" + role,
+                    new CorrectedHandler(pipeline, frameDistributor, role));
+        }
+        if (curbSvc != null) {
+            for (String role : CAM_ROLE) {
+                server.createContext("/debug/curb/" + role,
+                        new DebugCurbHandler(pipeline, frameDistributor, curbSvc, role));
+            }
+        }
+        server.createContext("/api/signals", new SignalsHandler(signals, false));
+        server.createContext("/api/signals/stream", new SignalsHandler(signals, true));
+        server.createContext("/api/vehicle/simulate", new VehicleSimulateHandler(vehicle));
+        server.createContext("/play",   new PlayerPageHandler(port, curbSvc != null));
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
+
+        SignalWebSocketServer wsServer = null;
+        if (vehicleConfig.signalWebSocketPort > 0) {
+            wsServer = new SignalWebSocketServer(
+                    vehicleConfig.signalWebSocketPort, signals, vehicleConfig.signalWebSocketHz);
+            wsServer.start();
+        }
  
         System.out.println("Server started  ->  http://localhost:" + port + "/play");
+        System.out.println("  Panorama (no curb overlay): /stitch");
+        if (curbSvc != null) {
+            System.out.println("  Curb DEV overlay: /debug/curb/right  (also left, front, rear)");
+            System.out.println("  Curb JSON: /api/signals");
+        }
+        if (vehicleConfig.signalWebSocketPort > 0) {
+            System.out.println("  Signal WebSocket: ws://localhost:"
+                    + vehicleConfig.signalWebSocketPort + "/signals");
+        }
         for (int i = 0; i < CAM_ROLE.length; i++) {
             System.out.println("  " + CAM_ROLE[i] + " = " + videos[i]);
         }
@@ -101,7 +167,7 @@ public class VideoStreamingServer {
                         + CAM_ROLE[i] + ".mp4)");
                 return null;
             }
-            found[i] = ensureDecodable(found[i]);
+            found[i] = CameraIo.ensureDecodable(found[i]);
         }
         return found;
     }
@@ -140,12 +206,12 @@ public class VideoStreamingServer {
     }
  
     private static class StitchHandler implements HttpHandler {
-        private final Path[] videoFiles;
         private final SurroundPipeline pipeline;
+        private final FrameDistributor distributor;
 
-        StitchHandler(Path[] f, SurroundPipeline pipeline) {
-            this.videoFiles = f;
+        StitchHandler(SurroundPipeline pipeline, FrameDistributor distributor) {
             this.pipeline = pipeline;
+            this.distributor = distributor;
         }
 
         @Override public void handle(HttpExchange ex) throws IOException {
@@ -153,18 +219,100 @@ public class VideoStreamingServer {
                 ex.sendResponseHeaders(405, -1);
                 return;
             }
-            streamMjpeg(ex, videoFiles, pipeline, false, -1);
+            streamMjpeg(ex, pipeline, distributor, false, -1);
         }
     }
 
-    private static class CorrectedHandler implements HttpHandler {
-        private final Path[] videoFiles;
+    private static class SignalsHandler implements HttpHandler {
+        private final SignalPublisher publisher;
+        private final boolean stream;
+
+        SignalsHandler(SignalPublisher publisher, boolean stream) {
+            this.publisher = publisher;
+            this.stream = stream;
+        }
+
+        @Override public void handle(HttpExchange ex) throws IOException {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            if (stream) {
+                ex.getResponseHeaders().set("Content-Type", "application/x-ndjson; charset=UTF-8");
+                ex.sendResponseHeaders(200, 0);
+                try (OutputStream out = ex.getResponseBody()) {
+                    while (true) {
+                        String line = publisher.toJson();
+                        out.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        Thread.sleep(100);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            } else {
+                byte[] bytes = publisher.toJson().getBytes(StandardCharsets.UTF_8);
+                ex.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+                ex.sendResponseHeaders(200, bytes.length);
+                try (OutputStream out = ex.getResponseBody()) {
+                    out.write(bytes);
+                }
+            }
+        }
+    }
+
+    private static class VehicleSimulateHandler implements HttpHandler {
+        private final UdpVehicleSignalService vehicleService;
+
+        VehicleSimulateHandler(UdpVehicleSignalService vehicleService) {
+            this.vehicleService = vehicleService;
+        }
+
+        @Override public void handle(HttpExchange ex) throws IOException {
+            String method = ex.getRequestMethod();
+            if (!"POST".equalsIgnoreCase(method) && !"GET".equalsIgnoreCase(method)) {
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            String scenario = queryParam(ex.getRequestURI().getQuery(), "scenario");
+            if (scenario == null || scenario.isEmpty()) {
+                scenario = "RIGHT_TURN";
+            }
+            vehicleService.simulator().startScenario(scenario);
+            byte[] body = ("{\"started\":true,\"scenario\":\"" + scenario + "\"}")
+                    .getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+            ex.sendResponseHeaders(200, body.length);
+            try (OutputStream out = ex.getResponseBody()) {
+                out.write(body);
+            }
+        }
+
+        private static String queryParam(String query, String key) {
+            if (query == null) {
+                return null;
+            }
+            for (String part : query.split("&")) {
+                int eq = part.indexOf('=');
+                if (eq > 0 && part.substring(0, eq).equals(key)) {
+                    return part.substring(eq + 1);
+                }
+            }
+            return null;
+        }
+    }
+
+    private static class DebugCurbHandler implements HttpHandler {
         private final SurroundPipeline pipeline;
+        private final FrameDistributor distributor;
+        private final CurbDetectionService curbService;
         private final String role;
 
-        CorrectedHandler(Path[] f, SurroundPipeline pipeline, String role) {
-            this.videoFiles = f;
+        DebugCurbHandler(SurroundPipeline pipeline, FrameDistributor distributor,
+                         CurbDetectionService curbService, String role) {
             this.pipeline = pipeline;
+            this.distributor = distributor;
+            this.curbService = curbService;
             this.role = role;
         }
 
@@ -178,89 +326,167 @@ public class VideoStreamingServer {
                 ex.sendResponseHeaders(404, -1);
                 return;
             }
-            streamMjpeg(ex, videoFiles, pipeline, true, idx);
+            ex.getResponseHeaders().set("Content-Type",
+                    "multipart/x-mixed-replace; boundary=frame");
+            ex.sendResponseHeaders(200, 0);
+            Mat rect = new Mat();
+            long lastSeq = 0;
+            try (OutputStream out = ex.getResponseBody()) {
+                while (true) {
+                    FrameSnapshot snap;
+                    try {
+                        snap = distributor.awaitVideoFrame(lastSeq);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    try {
+                        pipeline.rectify(idx, snap.fisheyeBgr[idx], rect);
+                        FusedCurbResult fused = curbService.lastFusedResult();
+                        CurbDetectionResult cam = fused == null
+                                ? CurbDetectionResult.noDetection(snap.timestampMs, role)
+                                : pickCamera(fused, role);
+                        CurbDebugOverlay.draw(rect, cam);
+                        writeFrame(out, encodeJpeg(rect));
+                        lastSeq = snap.sequence;
+                    } finally {
+                        snap.release();
+                    }
+                }
+            }
         }
     }
 
-    private static void streamMjpeg(HttpExchange ex, Path[] videoFiles,
-                                    SurroundPipeline pipeline, boolean rectilinear,
-                                    int cameraIndex) throws IOException {
-        VideoCapture[] caps = new VideoCapture[videoFiles.length];
-        for (int i = 0; i < videoFiles.length; i++) {
-            caps[i] = openVideo(videoFiles[i]);
-            if (caps[i] == null || !caps[i].isOpened()) {
-                System.err.println("Could not open video: " + videoFiles[i]);
-                ex.sendResponseHeaders(500, -1);
-                return;
+    private static CurbDetectionResult pickCamera(FusedCurbResult fused, String role) {
+        for (CurbDetectionResult c : fused.perCamera) {
+            if (c.cameraId.equalsIgnoreCase(role)) {
+                return c;
             }
         }
+        return CurbDetectionResult.noDetection(fused.timestampMs, role);
+    }
+
+    private static class CorrectedHandler implements HttpHandler {
+        private final SurroundPipeline pipeline;
+        private final FrameDistributor distributor;
+        private final String role;
+
+        CorrectedHandler(SurroundPipeline pipeline, FrameDistributor distributor, String role) {
+            this.pipeline = pipeline;
+            this.distributor = distributor;
+            this.role = role;
+        }
+
+        @Override public void handle(HttpExchange ex) throws IOException {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            int idx = pipeline.cameraIndex(role);
+            if (idx < 0) {
+                ex.sendResponseHeaders(404, -1);
+                return;
+            }
+            streamMjpeg(ex, pipeline, distributor, true, idx);
+        }
+    }
+
+    private static void streamMjpeg(HttpExchange ex,
+                                    SurroundPipeline pipeline,
+                                    FrameDistributor distributor,
+                                    boolean rectilinear,
+                                    int cameraIndex) throws IOException {
         ex.getResponseHeaders().set("Content-Type",
                 "multipart/x-mixed-replace; boundary=frame");
         ex.sendResponseHeaders(200, 0);
+        Mat rect = new Mat();
+        long lastSeq = 0;
         try (OutputStream out = ex.getResponseBody()) {
-            Mat[] frames = new Mat[videoFiles.length];
-            Mat rect = new Mat();
-            for (int i = 0; i < videoFiles.length; i++) {
-                frames[i] = new Mat();
-            }
             while (true) {
-                boolean allReady = true;
-                for (int i = 0; i < caps.length; i++) {
-                    if (!readOrLoop(caps, i, videoFiles[i], frames[i])) {
-                        allReady = false;
+                FrameSnapshot snap;
+                try {
+                    snap = distributor.awaitVideoFrame(lastSeq);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                try {
+                    Mat output;
+                    if (rectilinear) {
+                        pipeline.rectify(cameraIndex, snap.fisheyeBgr[cameraIndex], rect);
+                        output = rect;
+                    } else {
+                        output = pipeline.stitchPanorama(snap.fisheyeBgr);
                     }
-                }
-                if (!allReady) {
-                    continue;
-                }
-                Mat output;
-                if (rectilinear) {
-                    pipeline.rectify(cameraIndex, frames[cameraIndex], rect);
-                    output = rect;
-                } else {
-                    output = pipeline.stitchPanorama(frames);
-                }
-                writeFrame(out, encodeJpeg(output));
-                if (!rectilinear) {
-                    output.release();
-                }
-            }
-        } finally {
-            for (VideoCapture c : caps) {
-                if (c != null) {
-                    c.release();
+                    writeFrame(out, encodeJpeg(output));
+                    if (!rectilinear) {
+                        output.release();
+                    }
+                    lastSeq = snap.sequence;
+                } finally {
+                    snap.release();
                 }
             }
         }
     }
  
     private static class PlayerPageHandler implements HttpHandler {
+        private final int port;
+        private final boolean curbEnabled;
+
+        PlayerPageHandler(int port, boolean curbEnabled) {
+            this.port = port;
+            this.curbEnabled = curbEnabled;
+        }
+
         @Override public void handle(HttpExchange ex) throws IOException {
+            String curbPanel = "";
+            if (curbEnabled) {
+                curbPanel = ""
+                    + "<div id='curbStatus' class='curb-status'>Curb: loading…</div>"
+                    + "<div class='split'>"
+                    + "  <div class='pano-wrap'><img src='/stitch' alt='panorama'></div>"
+                    + "  <div class='pano-wrap'><img src='/debug/curb/right' alt='curb debug right'></div>"
+                    + "</div>"
+                    + "<p class='hint'>Left: stitch (no overlay). Right: dev curb overlay on corrected camera. "
+                    + "Production Android draws zones from <code>/api/signals</code>.</p>"
+                    + "<script>"
+                    + "async function poll(){try{const r=await fetch('/api/signals');"
+                    + "const j=await r.json();const c=j.curb||{};"
+                    + "const z=c.zone||c.status||'—';"
+                    + "const el=document.getElementById('curbStatus');"
+                    + "el.textContent=c.detected?('Curb '+z+' @ '+c.distanceMeters+'m ('+c.camera+')'):('Curb: '+ (c.status||'none'));"
+                    + "el.className='curb-status zone-'+(c.zone||'UNKNOWN');"
+                    + "}catch(e){}} setInterval(poll,500); poll();"
+                    + "</script>";
+            } else {
+                curbPanel = "<div class='pano-wrap'><img src='/stitch' alt='panorama'></div>";
+            }
             String html = "<!DOCTYPE html><html lang='en'><head>"
                 + "<meta charset='UTF-8'>"
                 + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>Common-horizon panorama</title>"
+                + "<title>Surround + curb debug</title>"
                 + "<style>"
                 + "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }"
                 + "html, body { height: 100%; background: #0a0a0f; color: #e0e0e0;"
-                + "  font-family: 'Segoe UI', sans-serif; overflow: hidden; }"
+                + "  font-family: 'Segoe UI', sans-serif; }"
                 + ".container { display: flex; flex-direction: column;"
-                + "  align-items: center; justify-content: center;"
-                + "  height: 100vh; padding: 16px; gap: 12px; }"
-                + "h1 { font-size: 1.25rem; font-weight: 300; letter-spacing: 1px;"
-                + "  color: #7ec8e3; text-align: center; flex-shrink: 0; }"
-                + ".pano-wrap { width: 100%; flex: 1; min-height: 0;"
-                + "  border: 1px solid #2a2a3a; border-radius: 8px; overflow: hidden;"
-                + "  display: flex; align-items: center; justify-content: center; }"
-                + ".pano-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }"
+                + "  height: 100vh; padding: 12px; gap: 8px; }"
+                + "h1 { font-size: 1.1rem; font-weight: 400; color: #7ec8e3; text-align: center; }"
+                + ".split { display: flex; gap: 8px; flex: 1; min-height: 0; }"
+                + ".pano-wrap { flex: 1; min-width: 0; border: 1px solid #2a2a3a; border-radius: 8px;"
+                + "  overflow: hidden; display: flex; align-items: center; justify-content: center; }"
+                + ".pano-wrap img { width: 100%; height: 100%; object-fit: contain; }"
+                + ".curb-status { text-align: center; padding: 8px; border-radius: 6px; background: #1a1a24; }"
+                + ".zone-GREEN{background:#0d2a14;color:#8f8;} .zone-YELLOW{background:#2a2208;color:#fd8;}"
+                + ".zone-RED{background:#2a0a0a;color:#f88;} .hint{font-size:0.8rem;color:#888;text-align:center;}"
+                + "code{color:#9cf;}"
                 + "</style></head><body>"
                 + "<div class='container'>"
-                + "  <h1>common vehicle horizon</h1>"
-                + "  <div class='pano-wrap'>"
-                + "    <img src='/stitch' alt='stitched panorama'>"
-                + "  </div>"
+                + "<h1>Surround view (port " + port + ")</h1>"
+                + curbPanel
                 + "</div></body></html>";
-            byte[] bytes = html.getBytes("UTF-8");
+            byte[] bytes = html.getBytes(StandardCharsets.UTF_8);
             ex.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
             ex.sendResponseHeaders(200, bytes.length);
             try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }
