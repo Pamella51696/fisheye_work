@@ -1,0 +1,60 @@
+{
+    "type": "curb",
+    "v": 1,
+    "seq": 3,
+    "ts": 1791281353273,
+    "panorama": {
+        "width": 2320,
+        "height": 360
+    },
+    "thresholds": {
+        "dangerM": 0.5,
+        "warningM": 1.0
+    },
+    "zones": [
+        {
+            "id": "REAR_CENTER",
+            "pos": "REAR_CENTER",
+            "kind": "OBSTACLE",
+            "source": "ULTRASONIC",
+            "distanceM": 0.35,
+            "heightM": null,
+            "zone": "DANGER",
+            "level": 3,
+            "color": "#FF3B30",
+            "camera": "rear",
+            "pano": {
+                "x": 1331,
+                "w": 218,
+                "xNorm": 0.574,
+                "wNorm": 0.094
+            }
+        },
+        {
+            "id": "LEFT_REAR",
+            "pos": "LEFT_REAR",
+            "kind": "CURB",
+            "source": "ULTRASONIC",
+            "distanceM": 0.8,
+            "heightM": 0.12,
+            "zone": "WARNING",
+            "level": 2,
+            "color": "#FFCC00",
+            "camera": "left",
+            "pano": {
+                "x": 1680,
+                "w": 218,
+                "xNorm": 0.724,
+                "wNorm": 0.094
+            }
+        }
+    ],
+    "summary": {
+        "worstZone": "DANGER",
+        "worstColor": "#FF3B30",
+        "nearestDistanceM": 0.35,
+        "nearestSensorId": "REAR_CENTER",
+        "leftWorst": "WARNING",
+        "rightWorst": "NONE"
+    }
+}
