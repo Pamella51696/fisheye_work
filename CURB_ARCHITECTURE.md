@@ -1,7 +1,8 @@
 # Curb-side detection (perception layer)
 
 Runs **asynchronously** on top of the Kannala–Brandt / surround fisheye middleware.  
-**Video never waits on curb detection** — see `CameraCaptureManager` + `FrameDistributor`.
+**Video never waits on curb detection** — see `CameraCaptureManager` + `FrameDistributor`.  
+End-to-end middleware layout: **`MIDDLEWARE_ARCHITECTURE.md`**.
 
 ## Domains
 
