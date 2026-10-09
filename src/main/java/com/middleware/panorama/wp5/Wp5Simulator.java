@@ -10,7 +10,20 @@ final class Wp5Simulator {
     Wp5Simulator(Wp5Service svc) { this.svc = svc; }
 
     void start() {
-        Thread t = new Thread(() -> {
+        Thread t = newWorker();
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Same loop as {@link #start()}; interrupt the returned thread to stop. */
+    Thread startManaged() {
+        Thread t = newWorker();
+        t.start();
+        return t;
+    }
+
+    private Thread newWorker() {
+        return new Thread(() -> {
             long t0 = System.currentTimeMillis();
             while (!Thread.currentThread().isInterrupted()) {
                 double sec = (System.currentTimeMillis() - t0) / 1000.0;
@@ -27,8 +40,6 @@ final class Wp5Simulator {
                 try { Thread.sleep(50); } catch (InterruptedException e) { return; } // 20 Hz
             }
         }, "wp5-simulator");
-        t.setDaemon(true);
-        t.start();
     }
 
     private static String s(String id, String pos, double d, String kind, String src, double h) {
