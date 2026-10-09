@@ -10,8 +10,8 @@ End-to-end middleware layout: **`MIDDLEWARE_ARCHITECTURE.md`**.
 |--------|----------------|
 | **Video** | `CameraCaptureManager` → `SurroundPipeline` → `/stitch`, `/corrected/*` |
 | **Curb analytics** | `CurbDetectionService` (worker thread, capacity-1 frame queue) |
-| **Vehicle signals** | `UdpVehicleSignalService` + `VehicleSignalSimulator` (UDP later) |
-| **Android signals** | `SignalPublisher` → `/api/signals` |
+| **Vehicle signals** | `UdpVehicleSignalService` (sim / UDP ingress / constant) |
+| **Android signals** | `SignalPublisher` → HTTP + `SignalWebSocketServer` `:9091/signals` |
 
 ## Pipeline
 

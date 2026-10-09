@@ -25,7 +25,7 @@ public final class SignalPublisher {
 
     private double lastSentSteering = Double.NaN;
 
-    public String toJson() {
+    public synchronized String toJson() {
         long ts = System.currentTimeMillis();
         CurbState curb = curbService != null ? curbService.currentState() : CurbState.unavailable();
         VehicleSignal vehicle = vehicleService.getCurrentSignal();

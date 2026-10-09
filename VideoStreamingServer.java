@@ -35,7 +35,9 @@ import surround.runtime.FrameDistributor;
 import surround.runtime.FrameSnapshot;
 import surround.runtime.SurroundPipeline;
 import surround.signal.SignalPublisher;
+import surround.signal.SignalWebSocketServer;
 import surround.vehicle.UdpVehicleSignalService;
+import surround.vehicle.VehicleSignalConfig;
 import surround.vehicle.VehicleSignalSimulator;
  
 /**
@@ -54,15 +56,8 @@ public class VideoStreamingServer {
     private static final String[] CAM_ROLE = { "left", "front", "right", "rear" };
  
     public static void main(String[] args) throws IOException {
-        int port = DEFAULT_PORT;
-        if (args.length >= 1) {
-            try {
-                port = Integer.parseInt(args[0]);
-            } catch (NumberFormatException e) {
-                System.err.println("First argument must be a port number, got: " + args[0]);
-                return;
-            }
-        }
+        VehicleSignalConfig vehicleConfig = VehicleSignalConfig.parse(args, DEFAULT_PORT);
+        int port = vehicleConfig.httpPort;
  
         Path folder = Paths.get(".").toAbsolutePath().normalize();
         Path[] videos = discoverClips(folder);
@@ -95,7 +90,8 @@ public class VideoStreamingServer {
 
         CurbDetectionService curbService = null;
         SignalPublisher signalPublisher = null;
-        UdpVehicleSignalService vehicleService = new UdpVehicleSignalService(new VehicleSignalSimulator());
+        UdpVehicleSignalService vehicleService =
+                new UdpVehicleSignalService(new VehicleSignalSimulator(), vehicleConfig);
         vehicleService.start();
         try {
             CurbConfig curbConfig = CurbConfig.load(CURB_CONFIG);
@@ -133,12 +129,23 @@ public class VideoStreamingServer {
         server.createContext("/play",   new PlayerPageHandler(port, curbSvc != null));
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
+
+        SignalWebSocketServer wsServer = null;
+        if (vehicleConfig.signalWebSocketPort > 0) {
+            wsServer = new SignalWebSocketServer(
+                    vehicleConfig.signalWebSocketPort, signals, vehicleConfig.signalWebSocketHz);
+            wsServer.start();
+        }
  
         System.out.println("Server started  ->  http://localhost:" + port + "/play");
         System.out.println("  Panorama (no curb overlay): /stitch");
         if (curbSvc != null) {
             System.out.println("  Curb DEV overlay: /debug/curb/right  (also left, front, rear)");
             System.out.println("  Curb JSON: /api/signals");
+        }
+        if (vehicleConfig.signalWebSocketPort > 0) {
+            System.out.println("  Signal WebSocket: ws://localhost:"
+                    + vehicleConfig.signalWebSocketPort + "/signals");
         }
         for (int i = 0; i < CAM_ROLE.length; i++) {
             System.out.println("  " + CAM_ROLE[i] + " = " + videos[i]);

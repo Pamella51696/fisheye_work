@@ -21,12 +21,21 @@ scripts\run.bat
 
 Then open: http://localhost:9090/play
 
-Signals (curb + simulated steering): http://localhost:9090/api/signals  
+Signals (curb + vehicle): http://localhost:9090/api/signals  
+WebSocket signals (recommended for overlay): `ws://localhost:9091/signals`  
 
 **Curb is not drawn on `/stitch`** (Android overlay). For local testing use:  
 http://localhost:9090/play (split view) or http://localhost:9090/debug/curb/right  
 
-Trigger a turn scenario: `POST http://localhost:9090/api/vehicle/simulate?scenario=RIGHT_TURN`
+Trigger a turn scenario (sim mode): `POST http://localhost:9090/api/vehicle/simulate?scenario=RIGHT_TURN`
+
+Real vehicle / phone UDP ingress (16-byte LE steering + heading):
+
+```bash
+java -cp "out:$OPENCV_JAR" VideoStreamingServer --vehicle-pose-mode udp --udp-listen-port 45454
+```
+
+Optional mirror to Android phone IP: add `--udp-target 192.168.1.50 --udp-port 45454`
 
 If your jar is not named `opencv-490.jar`, adjust `OPENCV_DIR` or rename/copy the jar under `%OPENCV_DIR%\java\`.
 

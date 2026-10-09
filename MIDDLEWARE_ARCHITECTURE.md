@@ -145,14 +145,27 @@ When curb analytics is down:
 { "curb": { "status": "UNAVAILABLE" } }
 ```
 
-**Rate limiting:** `CurbResultFilter` reduces spam; `SignalPublisher` applies a steering deadband (~1°). Use `/api/signals/stream` for ~10 Hz NDJSON during development. A dedicated WebSocket port can replace the stream later without changing field names.
+**Rate limiting:** `CurbResultFilter` reduces spam; `SignalPublisher` applies a steering deadband (~1°). Use `/api/signals/stream` or **`SignalWebSocketServer`** on port **9091** (`ws://host:9091/signals`) — same JSON shape.
+
+### Vehicle pose modes (`--vehicle-pose-mode`)
+
+| Mode | Source |
+|------|--------|
+| `sim` (default) | `VehicleSignalSimulator` + `POST /api/vehicle/simulate` |
+| `udp` | Ingress on `--udp-listen-port` (16-byte LE `[steeringDeg, headingDeg]`) |
+| `constant` | Fixed `--steering-deg` / `--yaw-deg` |
+
+Optional **egress** to Android: `--udp-target <ip>` publishes the active provider at `--udp-hz` (legacy phone listener).
 
 ## Two channels for Android
 
 | Channel | Protocol | Endpoints |
 |---------|----------|-----------|
 | Video | HTTP MJPEG | `/stitch`, `/corrected/left`, … |
-| Signals | HTTP JSON | `/api/signals`, `/api/signals/stream` |
+| Signals (HTTP) | JSON / NDJSON | `/api/signals`, `/api/signals/stream` |
+| Signals (WebSocket) | Text JSON ~10 Hz | `ws://host:9091/signals` (default port) |
+| Vehicle UDP ingress | 16-byte LE doubles | Listen `--udp-listen-port` (mode `udp`) |
+| Vehicle UDP egress (optional) | Same packet to phone | `--udp-target <phone-ip>` |
 | Dev overlay | HTTP MJPEG | `/debug/curb/<role>` (not for production UI) |
 
 Trigger a steering scenario:
