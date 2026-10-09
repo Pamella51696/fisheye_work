@@ -29,6 +29,11 @@ public final class Wp5Config {
     public final boolean curbOnly;           // true = zones ONLY for sensors with kind=CURB (obstacle sensors are ignored)
     // ---- Security ----
     public final String ingestToken;        // "" = no auth (lab only!)
+    // ---- Vehicle signal source (UDP vs simulator) ----
+    public final SignalSource signalSource;
+    public final long udpTimeoutMs;
+    public final long autoStartupTimeoutMs;
+    public final int udpListenPort;
     // ---- Customisation file (3D node names, axes, colours, panorama map) ----
     public final VehicleProfile profile;
     public final String profileSource;
@@ -68,6 +73,18 @@ public final class Wp5Config {
         staleMs             = (long) d("staleMs", 500);
         curbOnly            = !"false".equalsIgnoreCase(System.getProperty("wp5.curbOnly", "true").trim());   // -Dwp5.curbOnly=false = old behaviour
         ingestToken         = System.getProperty("wp5.ingestToken", "");
+
+        SignalSource parsed = SignalSource.parse(System.getProperty("wp5.signalSource"));
+        if (parsed != null) {
+            signalSource = parsed;
+        } else if (Boolean.getBoolean("wp5.simulate")) {
+            signalSource = SignalSource.SIMULATOR;
+        } else {
+            signalSource = SignalSource.AUTO;
+        }
+        udpTimeoutMs = (long) d("udpTimeoutMs", 1000);
+        autoStartupTimeoutMs = (long) d("autoStartupTimeoutMs", 3000);
+        udpListenPort = (int) d("udpListenPort", 45454);
     }
 
     public static Wp5Config load() { return new Wp5Config(); }

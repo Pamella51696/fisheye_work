@@ -45,6 +45,7 @@ public final class Wp5Service {
     private long lastSteeringInputMs;
     private String lastCurbSignature = "";
     private long lastCurbPublishMs;
+    private VehicleSignalManager signalManager;
 
     private Wp5Service(Wp5Config cfg, String[] cameraNames, int camW, int camH, int overlap) {
         this.cfg = cfg;
@@ -62,19 +63,25 @@ public final class Wp5Service {
         server.createContext("/api/v1/ingest/steering", s.new IngestHandler(true));
         server.createContext("/api/v1/ingest/range", s.new IngestHandler(false));
         server.createContext("/api/v1/profile", s.new ProfileHandler());
+        server.createContext("/api/v1/signal-source", s.new SignalSourceHandler());
         server.createContext("/wp5", s.new DebugPageHandler());
         server.createContext("/wp5/viewer", s.new ViewerPageHandler());
         System.out.println("[WP5] profile: " + cfg.profile.name + "  (from " + cfg.profileSource + ")");
         s.ticker.scheduleAtFixedRate(s::tick, 100, 100, TimeUnit.MILLISECONDS);
-        if (Boolean.getBoolean("wp5.simulate")) {
-            new Wp5Simulator(s).start();
-            System.out.println("[WP5] simulator ON (no vehicle bus needed)");
-        }
+        s.signalManager = new VehicleSignalManager(cfg, s);
+        s.signalManager.start();
+        System.out.println("[WP5] vehicle signal source: " + cfg.signalSource
+                + " (override: -Dwp5.signalSource=AUTO|UDP|SIMULATOR)");
         System.out.println("[WP5] Signals (SSE) →  /api/v1/signals    Debug page →  /wp5    Android stand-in viewer →  /wp5/viewer");
         return s;
     }
 
-    public void stop() { ticker.shutdownNow(); }
+    public void stop() {
+        ticker.shutdownNow();
+        if (signalManager != null) {
+            signalManager.close();
+        }
+    }
 
     // ---------------------------------------------------------------- inputs
 
@@ -197,7 +204,12 @@ public final class Wp5Service {
                 if (steering) {
                     double a = Json.getNum(body, "steeringWheelDeg", Double.NaN);
                     if (Double.isNaN(a)) { send(ex, 400, "application/json", "{\"error\":\"steeringWheelDeg missing\"}"); return; }
-                    onSteeringInput(a, Json.getStr(body, "gear", "D"), Json.getNum(body, "speedKph", 0));
+                    if (signalManager != null) {
+                        signalManager.onHttpSteering(a, Json.getStr(body, "gear", "D"),
+                                Json.getNum(body, "speedKph", 0));
+                    } else {
+                        onSteeringInput(a, Json.getStr(body, "gear", "D"), Json.getNum(body, "speedKph", 0));
+                    }
                     send(ex, 200, "application/json", "{\"ok\":true}");
                 } else {
                     int n = curbModel.ingestJson(body, System.currentTimeMillis());
@@ -214,6 +226,15 @@ public final class Wp5Service {
         @Override public void handle(HttpExchange ex) throws IOException {
             if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) { ex.sendResponseHeaders(405, -1); return; }
             send(ex, 200, "application/json; charset=UTF-8", cfg.profile.rawJson);
+        }
+    }
+
+    private final class SignalSourceHandler implements HttpHandler {
+        @Override public void handle(HttpExchange ex) throws IOException {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) { ex.sendResponseHeaders(405, -1); return; }
+            String body = signalManager != null ? signalManager.statusJson()
+                    : "{\"signalSource\":\"" + cfg.signalSource.name() + "\"}";
+            send(ex, 200, "application/json; charset=UTF-8", body);
         }
     }
 
