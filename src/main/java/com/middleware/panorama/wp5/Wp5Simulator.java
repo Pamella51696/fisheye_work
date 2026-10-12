@@ -1,9 +1,9 @@
 package com.middleware.panorama.wp5;
 
 /**
- * Fake vehicle for development: sweeps the steering wheel left/right in reverse gear
- * and moves obstacles closer/further so every zone colour appears.
- * Enable with -Dwp5.simulate=true. NEVER enable in a real vehicle.
+ * Idle demo vehicle when no UDP feed is available: stable steering and curb distances
+ * (no rapid sine sweeps). Activated by {@link VehicleSignalManager} or -Dwp5.simulate=true.
+ * NEVER enable in a real vehicle.
  */
 final class Wp5Simulator {
     private final Wp5Service svc;
@@ -24,20 +24,20 @@ final class Wp5Simulator {
 
     private Thread newWorker() {
         return new Thread(() -> {
+            // Gentle motion only: slow ±25° over 90 s so the viewer stays readable.
             long t0 = System.currentTimeMillis();
+            final double rear = 1.8;
+            final double curb = 0.85;
             while (!Thread.currentThread().isInterrupted()) {
                 double sec = (System.currentTimeMillis() - t0) / 1000.0;
-                double steer = 450.0 * Math.sin(2 * Math.PI * sec / 12.0);          // +-450 deg, 12 s period
+                double steer = 25.0 * Math.sin(2 * Math.PI * sec / 90.0);
                 svc.onSteeringInput(steer, "R", 1.5);
 
-                double rear = 1.35 + 1.15 * Math.sin(2 * Math.PI * sec / 8.0);      // 0.20 .. 2.50 m
-                double curb = 0.70 + 0.45 * Math.sin(2 * Math.PI * sec / 6.0 + 1);  // 0.25 .. 1.15 m
-                double right = 2.5;                                                  // clear
                 svc.onRangeJson("{\"sensors\":["
                     + s("RC", "REAR_CENTER", rear, "OBSTACLE", "ULTRASONIC", Double.NaN) + ","
                     + s("LR", "LEFT_REAR", curb, "CURB", "ULTRASONIC", 0.12) + ","
-                    + s("RR", "RIGHT_REAR", right, "CURB", "ULTRASONIC", Double.NaN) + "]}");
-                try { Thread.sleep(50); } catch (InterruptedException e) { return; } // 20 Hz
+                    + s("RR", "RIGHT_REAR", 2.5, "CURB", "ULTRASONIC", Double.NaN) + "]}");
+                try { Thread.sleep(250); } catch (InterruptedException e) { return; } // 4 Hz refresh (staleMs)
             }
         }, "wp5-simulator");
     }
