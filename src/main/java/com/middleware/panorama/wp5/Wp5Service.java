@@ -46,6 +46,8 @@ public final class Wp5Service {
     private String lastCurbSignature = "";
     private long lastCurbPublishMs;
     private VehicleSignalManager signalManager;
+    private volatile Wp5CameraCurbBridge cameraCurbBridge;
+    private volatile boolean cameraCurbActive;
 
     private Wp5Service(Wp5Config cfg, String[] cameraNames, int camW, int camH, int overlap) {
         this.cfg = cfg;
@@ -78,9 +80,31 @@ public final class Wp5Service {
 
     public void stop() {
         ticker.shutdownNow();
+        if (cameraCurbBridge != null) {
+            cameraCurbBridge.close();
+        }
         if (signalManager != null) {
             signalManager.close();
         }
+    }
+
+    /** Starts async camera curb → SSE {@code curb} topic (optional). */
+    public void startCameraCurb(java.nio.file.Path clipFolder) {
+        try {
+            cameraCurbBridge = Wp5CameraCurbBridge.start(this, clipFolder);
+            cameraCurbActive = cameraCurbBridge != null;
+        } catch (Exception e) {
+            System.err.println("[WP5] camera curb disabled: " + e.getMessage());
+        }
+    }
+
+    /** Called by {@link Wp5CameraCurbBridge}; bypasses ultrasonic {@link CurbModel}. */
+    public void publishCurbJson(String json) {
+        hub.publish("curb", json);
+    }
+
+    public boolean isCameraCurbActive() {
+        return cameraCurbActive;
     }
 
     // ---------------------------------------------------------------- inputs
@@ -114,7 +138,10 @@ public final class Wp5Service {
                 hub.publish("steering", lastPublishedSteering.toJson());
             }
 
-            // curb zones: publish when something visible changed, else heartbeat
+            // curb zones: ultrasonic ingest unless camera perception owns the topic
+            if (cameraCurbActive) {
+                return;
+            }
             if (curbModel.hasSensors()) {
                 CurbModel.CurbState st = curbModel.snapshot(curbSeq.get() + 1, now);
                 boolean changed = !st.signature.equals(lastCurbSignature);

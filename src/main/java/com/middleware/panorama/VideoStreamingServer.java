@@ -126,7 +126,11 @@ public class VideoStreamingServer {
                 TARGET_WIDTH, TARGET_HEIGHT, OVERLAP_PX));
 
         // WP5: steering / wheel + curb-zone signals. cameraNames MUST be in panel order.
-        Wp5Service.attach(server, cameraNames, TARGET_WIDTH, TARGET_HEIGHT, OVERLAP_PX);
+        Wp5Service wp5 = Wp5Service.attach(server, cameraNames, TARGET_WIDTH, TARGET_HEIGHT, OVERLAP_PX);
+        Path clipFolder = videos[0].toAbsolutePath().getParent();
+        if (clipFolder != null) {
+            wp5.startCameraCurb(clipFolder);
+        }
 
         // Every /stitch (MJPEG) and /api/v1/signals (SSE) client holds a thread for as long as it
         // is connected. A fixed pool of 4 is used up by the viewer + the phone, and then even the
