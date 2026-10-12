@@ -31,11 +31,24 @@ java -Dwp5.cameraCurb=true \
 
 ## Build
 
-Compile all Java (WP5 + surround + perception):
+**Requires OpenCV Java jar on the compile classpath** (not optional for this branch).
+
+Windows:
+
+```bat
+set OPENCV_DIR=C:\path\to\opencv\build
+scripts\compile.bat
+```
+
+Linux / macOS:
 
 ```bash
-./scripts/compile.sh   # see BUILD.md for OPENCV_JAR
+export OPENCV_JAR=/path/to/opencv/java/opencv-490.jar
+export JAVA_LIBRARY_PATH=/path/to/opencv/lib
+./scripts/compile.sh
 ```
+
+`compile.sh` / `compile.bat` skip `src/test`, `archive/`, and `target/` (no JUnit on compile path).
 
 Run WP5 server:
 

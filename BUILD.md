@@ -5,7 +5,9 @@
 
 `NoClassDefFoundError: surround/calibration/RigConfigLoader`
 
-Compile **all** `.java` files into an `out/` directory and run with `out` + OpenCV on the classpath.
+Compile production `.java` files into `out/` (excludes `src/test`, `archive/`, `target/`) and run with `out` + OpenCV on the classpath.
+
+**`OPENCV_JAR` is required at compile time** on the integration branch (surround + perception use OpenCV types).
 
 ## Windows (OpenCV 4.9 example)
 

@@ -139,10 +139,7 @@ public final class Wp5Service {
             }
 
             // curb zones: ultrasonic ingest unless camera perception owns the topic
-            if (cameraCurbActive) {
-                return;
-            }
-            if (curbModel.hasSensors()) {
+            if (!cameraCurbActive && curbModel.hasSensors()) {
                 CurbModel.CurbState st = curbModel.snapshot(curbSeq.get() + 1, now);
                 boolean changed = !st.signature.equals(lastCurbSignature);
                 if (changed || now - lastCurbPublishMs >= cfg.heartbeatMs) {
