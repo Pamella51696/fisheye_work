@@ -25,7 +25,7 @@ mkdir out
 echo Compiling all sources with OpenCV jar...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$root = (Get-Location).Path; " ^
-  "$src = Get-ChildItem -Path $root -Recurse -Filter *.java | Where-Object { $_.FullName -notmatch '\\out\\' } | ForEach-Object { $_.FullName }; " ^
+  "$src = Get-ChildItem -Path $root -Recurse -Filter *.java | Where-Object { $_.FullName -notmatch '\\out\\' -and $_.FullName -notmatch '\\target\\' -and $_.FullName -notmatch '\\archive\\' -and $_.FullName -notmatch '\\src\\test\\' -and $_.FullName -notmatch '\\tests\\' } | ForEach-Object { $_.FullName }; " ^
   "if ($src.Count -eq 0) { throw 'No .java files found' }; " ^
   "& javac -encoding UTF-8 -cp '%OPENCV_JAR%' -d out $src"
 if errorlevel 1 exit /b 1

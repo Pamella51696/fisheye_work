@@ -31,11 +31,28 @@ java -Dwp5.cameraCurb=true \
 
 ## Build
 
-Compile all Java (WP5 + surround + perception):
+### Maven (`pom.xml`)
 
 ```bash
-./scripts/compile.sh   # see BUILD.md for OPENCV_JAR
+mvn -q -DskipTests compile
+mvn -q exec:java -Dexec.mainClass=com.middleware.panorama.VideoStreamingServer -Dexec.args=9090
 ```
+
+### Makefile
+
+```bash
+make mvn-compile
+make mvn-run PORT=9090
+make help
+```
+
+### Scripts (local OpenCV jar)
+
+Windows: `scripts\compile.bat` then `scripts\run.bat` (set `OPENCV_DIR`).
+
+Linux/macOS: set `OPENCV_JAR` + `JAVA_LIBRARY_PATH`, then `./scripts/compile.sh`.
+
+`compile.sh` / `compile.bat` skip `src/test`, `archive/`, and `target/`.
 
 Run WP5 server:
 

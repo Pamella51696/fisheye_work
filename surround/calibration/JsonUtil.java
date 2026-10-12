@@ -8,37 +8,37 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /** Minimal JSON parser for rig config (objects, arrays, numbers, strings). */
-final class JsonUtil {
+public final class JsonUtil {
 
     private JsonUtil() {
     }
 
-    static Object parse(String json) {
+    public static Object parse(String json) {
         return new Parser(json).parseValue();
     }
 
     @SuppressWarnings("unchecked")
-    static Map<String, Object> asObject(Object o) {
+    public static Map<String, Object> asObject(Object o) {
         return (Map<String, Object>) o;
     }
 
     @SuppressWarnings("unchecked")
-    static List<Object> asArray(Object o) {
+    public static List<Object> asArray(Object o) {
         return (List<Object>) o;
     }
 
-    static double asDouble(Object o) {
+    public static double asDouble(Object o) {
         if (o instanceof Number) {
             return ((Number) o).doubleValue();
         }
         return Double.parseDouble(o.toString());
     }
 
-    static String asString(Object o) {
+    public static String asString(Object o) {
         return o.toString();
     }
 
-    static double asDouble(Map<String, Object> map, String key, double fallback) {
+    public static double asDouble(Map<String, Object> map, String key, double fallback) {
         Object o = map.get(key);
         return o == null ? fallback : asDouble(o);
     }
