@@ -2,3 +2,5 @@
 preview_pano.jpg
 *.class
 __pycache__/
+/out/
+/target/

@@ -52,13 +52,47 @@ set PATH=%OPENCV_DIR%\bin;%PATH%
 java -cp "out;%OPENCV_JAR%" -Djava.library.path="%OPENCV_DIR%\java\x64;%OPENCV_DIR%\bin" VideoStreamingServer
 ```
 
+## Maven (`pom.xml`) — recommended
+
+Downloads OpenCV Java (`org.openpnp:opencv`) from Maven Central; no local `OPENCV_JAR` needed for **compile**.
+
+```bash
+mvn -q -DskipTests compile
+mvn -q exec:java -Dexec.mainClass=com.middleware.panorama.VideoStreamingServer -Dexec.args=9090
+```
+
+Or:
+
+```bash
+make mvn-compile
+make mvn-run PORT=9090
+```
+
+Use your own OpenCV jar instead:
+
+```bash
+mvn -Plocal-opencv -Dopencv.jar.path=/path/to/opencv-490.jar -DskipTests compile
+```
+
+Tests: `mvn test` or `make mvn-test`
+
+## Makefile
+
+```bash
+make help
+make mvn-compile
+make mvn-run
+```
+
+Script-based build (local OpenCV jar required at compile time):
+
 ## Linux / macOS
 
 ```bash
 export OPENCV_JAR=/path/to/opencv/java/opencv-490.jar
 export JAVA_LIBRARY_PATH=/path/to/opencv/lib
-./scripts/compile.sh   # add -cp "$OPENCV_JAR" to javac if needed
-java -cp "out:$OPENCV_JAR" -Djava.library.path="$JAVA_LIBRARY_PATH" VideoStreamingServer
+./scripts/compile.sh
+java -cp "out:$OPENCV_JAR" -Djava.library.path="$JAVA_LIBRARY_PATH" com.middleware.panorama.VideoStreamingServer
 ```
 
 ## Inputs

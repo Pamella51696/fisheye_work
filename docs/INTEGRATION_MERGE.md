@@ -31,24 +31,28 @@ java -Dwp5.cameraCurb=true \
 
 ## Build
 
-**Requires OpenCV Java jar on the compile classpath** (not optional for this branch).
-
-Windows:
-
-```bat
-set OPENCV_DIR=C:\path\to\opencv\build
-scripts\compile.bat
-```
-
-Linux / macOS:
+### Maven (`pom.xml`)
 
 ```bash
-export OPENCV_JAR=/path/to/opencv/java/opencv-490.jar
-export JAVA_LIBRARY_PATH=/path/to/opencv/lib
-./scripts/compile.sh
+mvn -q -DskipTests compile
+mvn -q exec:java -Dexec.mainClass=com.middleware.panorama.VideoStreamingServer -Dexec.args=9090
 ```
 
-`compile.sh` / `compile.bat` skip `src/test`, `archive/`, and `target/` (no JUnit on compile path).
+### Makefile
+
+```bash
+make mvn-compile
+make mvn-run PORT=9090
+make help
+```
+
+### Scripts (local OpenCV jar)
+
+Windows: `scripts\compile.bat` then `scripts\run.bat` (set `OPENCV_DIR`).
+
+Linux/macOS: set `OPENCV_JAR` + `JAVA_LIBRARY_PATH`, then `./scripts/compile.sh`.
+
+`compile.sh` / `compile.bat` skip `src/test`, `archive/`, and `target/`.
 
 Run WP5 server:
 
