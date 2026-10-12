@@ -9,8 +9,7 @@ header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 16px
 h1{font-size:16px;font-weight:600;margin:0 8px 0 0}
 .pill{padding:3px 10px;border-radius:99px;background:var(--card);border:1px solid var(--line);color:var(--mut);font-size:12px}
 .pill.ok{color:var(--ok);border-color:var(--ok)}.pill.bad{color:var(--bad);border-color:var(--bad)}
-main{display:grid;grid-template-columns:minmax(0,1fr) 460px;gap:14px;padding:14px 16px}
-@media(max-width:1100px){main{grid-template-columns:1fr}}
+main{display:block;max-width:960px;margin:0 auto;padding:14px 16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
 .card h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);margin:0 0 8px;font-weight:600}
 #panoWrap{position:relative;line-height:0;background:#000;border-radius:6px;overflow:hidden}
@@ -44,26 +43,7 @@ pre{margin:6px 0 0;background:#0f131b;border:1px solid var(--line);border-radius
     <div id="swTxt" style="font-variant-numeric:tabular-nums;color:var(--mut);margin-top:4px;line-height:1.7">-</div></div></div>
   <pre id="rawSteer">waiting for steering message...</pre></div>
 </section>
-<aside>
- <div class="card"><h2>Fake vehicle (this page plays the CAN gateway)</h2>
-  <div class="row"><label>Drive from this page</label><input type="checkbox" id="send"> <span class="mut" id="sendInfo" style="color:var(--mut);font-size:12px">off</span></div>
-  <div class="warn">Start the server WITHOUT -Dwp5.simulate=true, otherwise both fight over the same values.</div>
-  <div class="row"><label>Steering wheel</label><input type="range" id="swa" min="-540" max="540" value="0" step="1"><span class="v" id="swaV">0&deg;</span></div>
-  <div class="row"><label>Gear</label><select id="gear"><option>R</option><option>D</option><option>P</option><option>N</option></select>
-   <label style="width:auto">Speed km/h</label><input type="text" id="spd" value="1.5" size="4"></div>
-  <div class="row"><label>Auto sweep</label><button id="sweep">start / stop</button><span style="color:var(--mut);font-size:12px">&plusmn;450&deg; sine, 12 s</span></div>
-  <div class="row"><label>Curb on side</label><label><input type="checkbox" class="cs" data-g="LEFT_" checked> left</label> <label><input type="checkbox" class="cs" data-g="RIGHT_" checked> right</label> <label><input type="checkbox" class="cs" data-g="FRONT_" checked> front</label> <label><input type="checkbox" class="cs" data-g="REAR_" checked> rear</label><span style="color:var(--mut);font-size:12px"> zones only for sensors that see a CURB</span></div>
-  <h2 style="margin-top:12px">Distance sensors (right end = clear)</h2><div id="sens"></div>
-  <div class="row"><label>Presets</label><button data-p="clear">all clear</button><button data-p="rear">rear danger</button><button data-p="curb">curb left-rear</button><button data-p="mix">mixed</button></div>
-  <div class="row"><label>Ingest API key</label><input type="text" id="key" placeholder="only if -Dwp5.ingestToken set" style="flex:1"></div>
- </div>
- <div class="card" style="margin-top:14px"><h2>What an Android dev should check</h2>
-  <ol style="margin:0;padding-left:18px;color:var(--mut);font-size:13px">
-   <li>Move steering slider: both front wheels turn the same way as the arrow; the inner wheel turns more.</li>
-   <li>Positive angle = LEFT turn (steering wheel rotates counter-clockwise).</li>
-   <li>Move a sensor: the coloured block sits over the right camera strip of the panorama.</li>
-   <li>Stop sending: sensors go grey after 0.5 s, steering turns STALE after 2 s.</li></ol></div>
-</aside></main>
+</main>
 <script>
 "use strict";
 const $=id=>document.getElementById(id);
@@ -72,10 +52,10 @@ const isCurb=z=>z.kind==="CURB";                                           // ZO
 const PANO_ZONES=false;                                                      // true = draw zone lines on the panorama again
 const ZC=["#FF3B30","#FFCC00","#34C759"];                                  // 3 zones: DANGER (near), WARNING (mid), SAFE (far)
 const zoneLines=()=>{const d=curb&&curb.thresholds?curb.thresholds.dangerM:.5,w=curb&&curb.thresholds?curb.thresholds.warningM:1;return [d,w,w+(w-d)];};
-const MAXR=2.6;                       // slider max = "clear"
 let veh={wheelbaseM:2.7,trackWidthM:1.6,vehicleWidthM:1.85,lengthM:4.4};
-let steer=null,curb=null,meta=null,lastSeq=-1,cnt={s:0,c:0},lastSteerAt=0,lastCurbAt=0;
+let steer=null,curb=null,meta=null,lastSeq=-1,cnt={s:0,c:0},lastSteerAt=0,lastCurbAt=0,curbVisSig="";
 const cur={swa:0,l:0,r:0},tgt={swa:0,l:0,r:0};
+const STEER_SMOOTH=.1;   // display-only low-pass (server may update slower)
 
 /* ---------- profile + meta (same calls the Android app makes once at start-up) ---------- */
 fetch("/api/v1/profile").then(r=>r.json()).then(p=>{
@@ -103,7 +83,11 @@ function connect(){
     tgt.swa=d.steeringWheelDeg;tgt.l=d.leftWheelDeg;tgt.r=d.rightWheelDeg;
     $("rawSteer").textContent=JSON.stringify(d,(k,v)=>Array.isArray(v)&&v.length>3?"[...]":v).slice(0,700);
   });
-  es.addEventListener("curb",e=>{curb=JSON.parse(e.data);cnt.c++;lastCurbAt=Date.now();
+  es.addEventListener("curb",e=>{
+    const d=JSON.parse(e.data);cnt.c++;lastCurbAt=Date.now();
+    const sig=d.zones.filter(isCurb).map(z=>z.pos+":"+z.zone+":"+z.distanceM).join("|");
+    if(sig===curbVisSig&&curb)return;
+    curbVisSig=sig;curb=d;
     $("tD").textContent=curb.thresholds.dangerM;$("tW").textContent=curb.thresholds.warningM;
     $("rawCurb").textContent="CURB zones only (obstacle sensors ignored)\n"+curb.zones.filter(isCurb).map(z=>z.pos+" "+z.zone+" "+(z.distanceM===null?"-":z.distanceM+"m")+" x="+z.pano.x+" w="+z.pano.w).join("\n");
     drawCurb();});
@@ -185,29 +169,8 @@ function drawSW(){sx.clearRect(0,0,150,150);sx.save();sx.translate(75,75);sx.rot
   sx.beginPath();sx.moveTo(-58,0);sx.lineTo(58,0);sx.moveTo(0,0);sx.lineTo(0,58);sx.stroke();
   sx.fillStyle="#FF3B30";sx.fillRect(-4,-66,8,16);sx.restore();             // red tick = 12 o'clock marker
   if(steer)$("swTxt").innerHTML="wheel "+cur.swa.toFixed(0)+"&deg;<br>FL "+cur.l.toFixed(1)+"&deg; &nbsp;FR "+cur.r.toFixed(1)+"&deg;<br>"+steer.direction+(steer.turnRadiusM?" R="+steer.turnRadiusM.toFixed(1)+" m":"")+"<br>gear "+steer.gear;}
-(function frame(){cur.swa+=(tgt.swa-cur.swa)*.35;cur.l+=(tgt.l-cur.l)*.35;cur.r+=(tgt.r-cur.r)*.35;drawTop();drawSW();requestAnimationFrame(frame);})();
-
-/* ---------- fake vehicle ---------- */
-const sens={};const sBox=$("sens");
-POS.forEach(p=>{const r=document.createElement("div");r.className="row";
-  r.innerHTML='<label>'+p+'</label><input type="range" min="0.1" max="'+MAXR+'" step="0.01" value="'+MAXR+'"><span class="v">clear</span>';
-  sBox.appendChild(r);const i=r.querySelector("input"),v=r.querySelector(".v");sens[p]=i;
-  const upd=()=>{v.textContent=+i.value>=MAXR-1e-9?"clear":(+i.value).toFixed(2)+" m";};i.oninput=upd;i.upd=upd;});
-const swa=$("swa");swa.oninput=()=>{$("swaV").textContent=swa.value+"\u00b0";};
-const PRE={clear:{},rear:{REAR_CENTER:.35,REAR_LEFT:.8,REAR_RIGHT:.9},curb:{LEFT_REAR:.7,LEFT_FRONT:1.4},mix:{REAR_CENTER:.4,LEFT_REAR:.8,RIGHT_REAR:1.8,FRONT_CENTER:1.2}};
-document.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{const p=PRE[b.dataset.p];POS.forEach(k=>{sens[k].value=p[k]!==undefined?p[k]:MAXR;sens[k].upd();});});
-let sweeping=false,t0=0;$("sweep").onclick=()=>{sweeping=!sweeping;t0=Date.now();};
-const curbSide=p=>{const c=[...document.querySelectorAll(".cs")].find(e=>p.startsWith(e.dataset.g));return !!(c&&c.checked);};
-const sendCb=$("send");let okCnt=0,errMsg="";
-function hdr(){const h={"Content-Type":"application/json"};const k=$("key").value.trim();if(k)h["X-Api-Key"]=k;return h;}
-setInterval(()=>{
-  if(sweeping){const a=450*Math.sin(2*Math.PI*(Date.now()-t0)/12000);swa.value=Math.round(a);swa.oninput();}
-  if(!sendCb.checked){$("sendInfo").textContent="off";return;}
-  const body1=JSON.stringify({steeringWheelDeg:+swa.value,gear:$("gear").value,speedKph:parseFloat($("spd").value)||0});
-  const body2=JSON.stringify({sensors:POS.map(p=>({id:p,pos:p,distanceM:+sens[p].value>=MAXR-1e-9?-1:+sens[p].value,
-    kind:curbSide(p)?"CURB":"OBSTACLE",source:"ULTRASONIC"}))});
-  Promise.all([fetch("/api/v1/ingest/steering",{method:"POST",headers:hdr(),body:body1}),fetch("/api/v1/ingest/range",{method:"POST",headers:hdr(),body:body2})])
-   .then(rs=>{okCnt++;errMsg=rs.map(r=>r.status).join("/");$("sendInfo").textContent="sending, HTTP "+errMsg;})
-   .catch(e=>{$("sendInfo").textContent="send failed: "+e;});
-},100);
+function smoothDisplay(curV,tgtV){const d=tgtV-curV;return Math.abs(d)<.15?tgtV:curV+d*STEER_SMOOTH;}
+(function frame(){
+  cur.swa=smoothDisplay(cur.swa,tgt.swa);cur.l=smoothDisplay(cur.l,tgt.l);cur.r=smoothDisplay(cur.r,tgt.r);
+  drawTop();drawSW();requestAnimationFrame(frame);})();
 </script></body></html>
