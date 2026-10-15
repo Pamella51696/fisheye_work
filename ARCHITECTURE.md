@@ -9,6 +9,8 @@
 
 Runtime always loads **`config/rig.json`** — swap parameters, not code.
 
+Hardware suppliers and integrators: extrinsic / geometric deliverables for calibration are defined in **`docs/FISHEYE_CALIBRATION_HARDWARE_REQUIREMENTS.md`**.
+
 ## Pipeline
 
 ```
